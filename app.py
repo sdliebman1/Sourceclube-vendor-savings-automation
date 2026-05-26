@@ -47,6 +47,11 @@ st.markdown(
         border: 1px solid #fecaca; background: #fff1f2; border-radius: 8px;
         padding: 0.85rem 1rem; color: #7f1d1d;
     }
+    .flow-card {
+        border: 1px solid #d0d5dd; background: #ffffff; border-radius: 10px;
+        padding: 1rem; min-height: 112px;
+    }
+    .flow-card strong {display: block; margin-bottom: 0.35rem;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -153,6 +158,14 @@ def token_overlap(left: str, right: str) -> float:
 
 def similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, normalize(left), normalize(right)).ratio()
+
+
+def confidence_band(score: float) -> str:
+    if score >= 0.78:
+        return "High"
+    if score >= 0.55:
+        return "Medium"
+    return "Low"
 
 
 def extract_metadata(raw: pd.DataFrame) -> dict[str, str]:
@@ -338,16 +351,21 @@ def score_catalog_match(row: pd.Series, catalog_row: pd.Series) -> tuple[float, 
     score = (0.45 * text_score) + (0.35 * token_score)
     if sku_exact:
         score += 0.35
-        reasons.append("manufacturer SKU exact match")
+        reasons.append("Strong SKU match")
     if manufacturer_exact:
         score += 0.12
         reasons.append("manufacturer match")
     if token_score >= 0.45:
         reasons.append("shared product terms")
     if text_score >= 0.72:
-        reasons.append("description similarity")
+        reasons.append("strong description match")
 
-    return min(score, 1.0), ", ".join(reasons) or "closest description match"
+    final_score = min(score, 1.0)
+    if final_score < 0.55:
+        return final_score, "Needs review: weak description/SKU signal"
+    if final_score < 0.78:
+        return final_score, "Partial match: " + (", ".join(reasons) or "closest description match")
+    return final_score, ", ".join(reasons) or "Strong description match"
 
 
 def match_items(history: pd.DataFrame, catalog: pd.DataFrame) -> pd.DataFrame:
@@ -384,7 +402,8 @@ def match_items(history: pd.DataFrame, catalog: pd.DataFrame) -> pd.DataFrame:
                 "SourceClub_Price": source_price if status != "No Match" else None,
                 "Match_Status": status,
                 "Match_Confidence": round(best_score, 2),
-                "Match_Reason": best_reason if status != "No Match" else "below confidence threshold",
+                "Confidence_Band": confidence_band(best_score),
+                "Match_Reason": best_reason if status != "No Match" else "Needs review: below confidence threshold",
                 "Current_Spend": current_spend,
                 "SourceClub_Spend": source_spend,
                 "Projected_Savings": current_spend - source_spend if status != "No Match" else 0.0,
@@ -398,20 +417,34 @@ def apply_manual_review(reviewed: pd.DataFrame, catalog: pd.DataFrame) -> pd.Dat
     result = reviewed.copy()
     if "Reviewer_Selected_Match" not in result:
         result["Reviewer_Selected_Match"] = ""
+    if "Reviewer_SourceClub_Price" not in result:
+        result["Reviewer_SourceClub_Price"] = None
     catalog_lookup = catalog.set_index("SourceClub_Item_Name").to_dict("index")
 
     for idx, row in result.iterrows():
         selected = row.get("Reviewer_Selected_Match", "")
+        override_price = number(row.get("Reviewer_SourceClub_Price"))
         if selected and selected in catalog_lookup:
             item = catalog_lookup[selected]
-            source_price = float(item["SourceClub_Price"])
+            source_price = override_price if override_price > 0 else float(item["SourceClub_Price"])
             result.at[idx, "Suggested_SourceClub_Match"] = selected
             result.at[idx, "SourceClub_Manufacturer_SKU"] = item["Manufacturer_SKU"]
             result.at[idx, "SourceClub_Price"] = source_price
             result.at[idx, "Match_Status"] = "Reviewed Match"
             result.at[idx, "Match_Confidence"] = 1.0
-            result.at[idx, "Match_Reason"] = "human approved override"
+            result.at[idx, "Confidence_Band"] = "High"
+            result.at[idx, "Match_Reason"] = "Human approved override"
             result.at[idx, "SourceClub_Spend"] = source_price * float(row["Quantity"])
+            result.at[idx, "Projected_Savings"] = float(row["Current_Spend"]) - result.at[idx, "SourceClub_Spend"]
+        current_source_price = number(row.get("SourceClub_Price"))
+        price_changed = override_price > 0 and abs(override_price - current_source_price) > 0.005
+        if not selected and price_changed and pd.notna(row.get("SourceClub_Price")):
+            result.at[idx, "SourceClub_Price"] = override_price
+            result.at[idx, "Match_Status"] = "Reviewed Price"
+            result.at[idx, "Match_Confidence"] = max(float(row.get("Match_Confidence", 0)), 0.78)
+            result.at[idx, "Confidence_Band"] = "High"
+            result.at[idx, "Match_Reason"] = "Human price override"
+            result.at[idx, "SourceClub_Spend"] = override_price * float(row["Quantity"])
             result.at[idx, "Projected_Savings"] = float(row["Current_Spend"]) - result.at[idx, "SourceClub_Spend"]
     return result
 
@@ -429,9 +462,16 @@ def benco_demo_raw() -> pd.DataFrame:
         ["BX900215", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "09/06/24", "$39.89", "2", "$79.78", ""],
         ["BX935041", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "09/17/24", "$39.89", "2", "$79.78", ""],
         ["BX994503", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "10/04/24", "$39.89", "2", "$79.78", ""],
+        ["BY080297", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "10/29/24", "$39.89", "2", "$79.78", ""],
+        ["BY124675", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "11/12/24", "$39.89", "1", "$39.89", ""],
         ["BY470898", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "03/04/25", "$50.15", "1", "$50.15", ""],
+        ["BY518869", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "03/18/25", "$50.15", "2", "$100.30", ""],
+        ["BY752939", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "05/28/25", "$50.15", "2", "$100.30", ""],
+        ["BY793439", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "06/10/25", "$50.15", "1", "$50.15", ""],
         ["BY837162", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "06/24/25", "$50.15", "2", "$100.30", ""],
-        ["", "", "", "", "", "", "Total for Anesthetic - Lidocaines:", "", "$389.79"],
+        ["BY892613", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "07/11/25", "$50.15", "1", "$50.15", ""],
+        ["BZ034330", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "08/19/25", "$50.15", "3", "$150.45", ""],
+        ["", "", "", "", "", "", "Total for Anesthetic - Lidocaines:", "", "$960.81"],
         ["Anesthetic - Mepivicaines", "", "", "", "", "", "", "", ""],
         ["Order", "Item", "Mfgr", "Description", "Order Date", "Price", "Qty", "Amount", ""],
         ["BY220583", "3306-656", "BENCO", "GRAHAM MEPIVACAINE 3% BX50", "12/11/24", "$51.56", "1", "$51.56", ""],
@@ -441,11 +481,17 @@ def benco_demo_raw() -> pd.DataFrame:
         ["BX840418", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "08/19/24", "$47.69", "5", "$238.45", ""],
         ["BX900215", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "09/06/24", "$47.69", "6", "$286.14", ""],
         ["BX935041", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "09/17/24", "$47.69", "3", "$143.07", ""],
+        ["BX994503", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "10/04/24", "$47.69", "3", "$143.07", ""],
         ["BY037670", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "10/16/24", "$47.69", "5", "$238.45", ""],
+        ["BY080297", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "10/29/24", "$47.69", "3", "$143.07", ""],
+        ["BY124675", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "11/12/24", "$47.69", "3", "$143.07", ""],
         ["", "", "", "", "", "", "Total for Anesthetic - Articaine:", "", "$906.11"],
         ["Gloves", "", "", "", "", "", "", "", ""],
         ["Order", "Item", "Mfgr", "Description", "Order Date", "Price", "Qty", "Amount", ""],
         ["BZ100001", "GLV-MED-NIT", "MEDLINE", "Nitrile Gloves - Medium", "08/12/25", "$11.90", "20", "$238.00", ""],
+        ["Preventive", "", "", "", "", "", "", "", ""],
+        ["Order", "Item", "Mfgr", "Description", "Order Date", "Price", "Qty", "Amount", ""],
+        ["BZ100114", "UNKNOWN-PASTE", "3M", "PROPHY PASTE MEDIUM MINT 200CT", "08/14/25", "$28.50", "4", "$114.00", ""],
     ]
     return pd.DataFrame(rows)
 
@@ -698,6 +744,24 @@ if cleaned.empty:
     st.stop()
 
 st.divider()
+initial_current_total = matched["Current_Spend"].sum() if not matched.empty else 0
+initial_savings_total = matched["Projected_Savings"].sum() if not matched.empty else 0
+confidence_counts = matched["Confidence_Band"].value_counts().to_dict() if "Confidence_Band" in matched else {}
+
+st.subheader("Executive snapshot")
+snapshot_cols = st.columns(5)
+snapshot_cols[0].metric("Total items processed", f"{len(aggregated):,}")
+snapshot_cols[1].metric("Potential savings", money(initial_savings_total))
+snapshot_cols[2].metric("High confidence", f"{confidence_counts.get('High', 0):,}")
+snapshot_cols[3].metric("Medium confidence", f"{confidence_counts.get('Medium', 0):,}")
+snapshot_cols[4].metric("Low confidence", f"{confidence_counts.get('Low', 0):,}")
+
+flow_cols = st.columns(4)
+flow_cols[0].markdown("<div class='flow-card'><strong>1. Clean vendor export</strong><span class='small-note'>Remove Benco headers, subtotals, blanks, and repeated table chrome.</span></div>", unsafe_allow_html=True)
+flow_cols[1].markdown("<div class='flow-card'><strong>2. Normalize purchases</strong><span class='small-note'>Convert raw rows into one canonical purchase-history table.</span></div>", unsafe_allow_html=True)
+flow_cols[2].markdown("<div class='flow-card'><strong>3. Match and review</strong><span class='small-note'>Auto-match confident rows and route uncertain rows to review.</span></div>", unsafe_allow_html=True)
+flow_cols[3].markdown("<div class='flow-card'><strong>4. Export package</strong><span class='small-note'>Generate the prospect PDF, detailed spreadsheet, and cleaned CSV.</span></div>", unsafe_allow_html=True)
+
 st.subheader("1. Vendor cleanup result")
 meta_cols = st.columns(4)
 meta_cols[0].metric("Prospect", metadata.get("Prepared For", "Unknown"))
@@ -732,6 +796,29 @@ st.subheader("3. Match review queue")
 review_options = [""] + catalog["SourceClub_Item_Name"].tolist()
 review_input = matched.copy()
 review_input["Reviewer_Selected_Match"] = ""
+review_input["Reviewer_SourceClub_Price"] = review_input["SourceClub_Price"]
+
+low_confidence = review_input[review_input["Confidence_Band"].isin(["Medium", "Low"])]
+if not low_confidence.empty:
+    st.warning(
+        f"{len(low_confidence)} row(s) need an operator look before sending. Use the override columns on the right to approve a different item or price."
+    )
+    st.dataframe(
+        low_confidence[
+            [
+                "Vendor_Item_Number",
+                "Description",
+                "Suggested_SourceClub_Match",
+                "Confidence_Band",
+                "Match_Confidence",
+                "Match_Reason",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.success("All matched rows cleared the high-confidence threshold. Review is still available for price overrides.")
 
 reviewed = st.data_editor(
     review_input,
@@ -746,18 +833,26 @@ reviewed = st.data_editor(
         "Suggested_SourceClub_Match",
         "SourceClub_Price",
         "Match_Status",
+        "Confidence_Band",
         "Match_Confidence",
         "Match_Reason",
         "Reviewer_Selected_Match",
+        "Reviewer_SourceClub_Price",
     ],
     column_config={
         "Current_Unit_Price": st.column_config.NumberColumn("Current Price", format="$%.2f"),
         "SourceClub_Price": st.column_config.NumberColumn("SourceClub Price", format="$%.2f"),
         "Match_Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1),
+        "Confidence_Band": st.column_config.TextColumn("Band"),
         "Reviewer_Selected_Match": st.column_config.SelectboxColumn(
             "Reviewer Override",
             options=review_options,
             help="Use this when the suggested match is wrong or the item was below the auto-match threshold.",
+        ),
+        "Reviewer_SourceClub_Price": st.column_config.NumberColumn(
+            "Override Price",
+            format="$%.2f",
+            help="Optional. Enter a corrected SourceClub price without changing the catalog.",
         ),
     },
     disabled=[
@@ -770,6 +865,7 @@ reviewed = st.data_editor(
         "SourceClub_Price",
         "Match_Status",
         "Match_Confidence",
+        "Confidence_Band",
         "Match_Reason",
     ],
 )
@@ -781,14 +877,21 @@ source_total = final["SourceClub_Spend"].sum()
 savings_total = final["Projected_Savings"].sum()
 review_count = int(final["Match_Status"].isin(["Needs Review", "No Match"]).sum())
 savings_rate = savings_total / current_total if current_total else 0
+final_confidence_counts = final["Confidence_Band"].value_counts().to_dict() if "Confidence_Band" in final else {}
 
-st.subheader("4. Prospect-ready savings summary")
-metric_cols = st.columns(5)
-metric_cols[0].metric("Current Spend", money(current_total))
-metric_cols[1].metric("SourceClub Spend", money(source_total))
-metric_cols[2].metric("Projected Savings", money(savings_total))
-metric_cols[3].metric("Savings Rate", f"{savings_rate:.1%}")
-metric_cols[4].metric("Needs Review", f"{review_count:,}")
+st.subheader("4. Prospect-ready savings package")
+metric_cols = st.columns(6)
+metric_cols[0].metric("Items Processed", f"{len(final):,}")
+metric_cols[1].metric("Current Spend", money(current_total))
+metric_cols[2].metric("SourceClub Spend", money(source_total))
+metric_cols[3].metric("Projected Savings", money(savings_total))
+metric_cols[4].metric("Savings Rate", f"{savings_rate:.1%}")
+metric_cols[5].metric("Needs Review", f"{review_count:,}")
+
+band_cols = st.columns(3)
+band_cols[0].metric("High Confidence", f"{final_confidence_counts.get('High', 0):,}")
+band_cols[1].metric("Medium Confidence", f"{final_confidence_counts.get('Medium', 0):,}")
+band_cols[2].metric("Low Confidence", f"{final_confidence_counts.get('Low', 0):,}")
 
 if review_count:
     st.markdown(
@@ -797,7 +900,7 @@ if review_count:
     )
 else:
     st.markdown(
-        "<div class='success-box'><b>All items are matched or reviewed.</b> The report is ready to send.</div>",
+        "<div class='success-box'><b>All items are matched or reviewed.</b> The prospect PDF and detailed operator spreadsheet are ready to export.</div>",
         unsafe_allow_html=True,
     )
 
@@ -813,6 +916,7 @@ st.dataframe(
             "SourceClub_Spend",
             "Projected_Savings",
             "Match_Status",
+            "Confidence_Band",
             "Match_Reason",
         ]
     ],
