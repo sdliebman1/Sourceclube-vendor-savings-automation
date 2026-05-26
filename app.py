@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import io
+import json
+import os
 import re
+import sqlite3
 from datetime import date
 from difflib import SequenceMatcher
+from hashlib import sha256
 from typing import Any
 
 import pandas as pd
 import streamlit as st
+
+try:
+    import requests
+
+    REQUESTS_AVAILABLE = True
+except Exception:
+    REQUESTS_AVAILABLE = False
 
 try:
     from reportlab.lib import colors
@@ -19,6 +30,9 @@ try:
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
+
+
+DB_PATH = os.getenv("SOURCECLUB_DB_PATH", "sourceclub_match_memory.db")
 
 
 st.set_page_config(
@@ -56,6 +70,186 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+def get_config(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name)
+        if value is not None:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def password_hash(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()
+
+
+def check_login() -> None:
+    configured_user = get_config("APP_USERNAME", "")
+    configured_password_hash = get_config("APP_PASSWORD_HASH", "")
+    configured_password = get_config("APP_PASSWORD", "")
+
+    if not configured_user and not configured_password_hash and not configured_password:
+        st.sidebar.info("Demo mode: add APP_USERNAME and APP_PASSWORD in Render to require login.")
+        return
+
+    if st.session_state.get("authenticated"):
+        with st.sidebar:
+            st.success(f"Signed in as {st.session_state.get('username', configured_user)}")
+            if st.button("Sign out"):
+                st.session_state.clear()
+                st.rerun()
+        return
+
+    st.title("SourceClub Savings Analysis Automation")
+    st.caption("Sign in to access the savings-analysis workspace.")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+
+    expected_hash = configured_password_hash or password_hash(configured_password)
+    if submitted:
+        if username == configured_user and password_hash(password) == expected_hash:
+            st.session_state["authenticated"] = True
+            st.session_state["username"] = username
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+    st.stop()
+
+
+def db_connect() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH)
+
+
+def init_db() -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS match_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                supplier TEXT NOT NULL,
+                vendor_item_number TEXT NOT NULL,
+                manufacturer TEXT,
+                description TEXT,
+                sourceclub_item_name TEXT NOT NULL,
+                sourceclub_manufacturer_sku TEXT,
+                sourceclub_price REAL NOT NULL,
+                reviewer TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(supplier, vendor_item_number, manufacturer, description)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analysis_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prospect TEXT,
+                supplier TEXT,
+                current_spend REAL,
+                sourceclub_spend REAL,
+                projected_savings REAL,
+                review_count INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+
+def memory_key(row: pd.Series) -> tuple[str, str, str, str]:
+    return (
+        normalize(row.get("Supplier", "")),
+        normalize(row.get("Vendor_Item_Number", "")),
+        normalize(row.get("Manufacturer", "")),
+        normalize(row.get("Description", "")),
+    )
+
+
+def load_match_memory() -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    init_db()
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT supplier, vendor_item_number, manufacturer, description,
+                   sourceclub_item_name, sourceclub_manufacturer_sku, sourceclub_price
+            FROM match_memory
+            """
+        ).fetchall()
+    return {
+        (supplier, item, manufacturer, description): {
+            "SourceClub_Item_Name": sourceclub_item,
+            "Manufacturer_SKU": sourceclub_sku,
+            "SourceClub_Price": sourceclub_price,
+        }
+        for supplier, item, manufacturer, description, sourceclub_item, sourceclub_sku, sourceclub_price in rows
+    }
+
+
+def save_approved_matches(final: pd.DataFrame, reviewer: str = "") -> int:
+    if final.empty:
+        return 0
+    init_db()
+    saved = 0
+    approved = final[final["Match_Status"].isin(["Matched", "Reviewed Match", "Reviewed Price"])]
+    with db_connect() as conn:
+        for _, row in approved.iterrows():
+            if not row.get("Suggested_SourceClub_Match") or pd.isna(row.get("SourceClub_Price")):
+                continue
+            conn.execute(
+                """
+                INSERT INTO match_memory (
+                    supplier, vendor_item_number, manufacturer, description,
+                    sourceclub_item_name, sourceclub_manufacturer_sku, sourceclub_price, reviewer
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(supplier, vendor_item_number, manufacturer, description)
+                DO UPDATE SET
+                    sourceclub_item_name=excluded.sourceclub_item_name,
+                    sourceclub_manufacturer_sku=excluded.sourceclub_manufacturer_sku,
+                    sourceclub_price=excluded.sourceclub_price,
+                    reviewer=excluded.reviewer,
+                    created_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    normalize(row.get("Supplier", "")),
+                    normalize(row.get("Vendor_Item_Number", "")),
+                    normalize(row.get("Manufacturer", "")),
+                    normalize(row.get("Description", "")),
+                    row.get("Suggested_SourceClub_Match"),
+                    row.get("SourceClub_Manufacturer_SKU", ""),
+                    float(row.get("SourceClub_Price", 0)),
+                    reviewer,
+                ),
+            )
+            saved += 1
+    return saved
+
+
+def save_analysis_run(metadata: dict[str, str], final: pd.DataFrame, review_count: int) -> None:
+    init_db()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_runs (prospect, supplier, current_spend, sourceclub_spend, projected_savings, review_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                metadata.get("Prepared For", ""),
+                metadata.get("Supplier", ""),
+                float(final["Current_Spend"].sum()) if not final.empty else 0,
+                float(final["SourceClub_Spend"].sum()) if not final.empty else 0,
+                float(final["Projected_Savings"].sum()) if not final.empty else 0,
+                int(review_count),
+            ),
+        )
+
+
+init_db()
+check_login()
 
 
 CATALOG = pd.DataFrame(
@@ -368,18 +562,112 @@ def score_catalog_match(row: pd.Series, catalog_row: pd.Series) -> tuple[float, 
     return final_score, ", ".join(reasons) or "Strong description match"
 
 
+def ai_match_suggestion(row: pd.Series, catalog: pd.DataFrame) -> dict[str, Any] | None:
+    api_key = get_config("OPENAI_API_KEY", "")
+    model = get_config("OPENAI_MODEL", "gpt-4.1-mini")
+    if not api_key or not REQUESTS_AVAILABLE:
+        return None
+
+    catalog_options = catalog[
+        ["SourceClub_Item_Name", "Manufacturer", "Manufacturer_SKU", "Pack_Size", "Unit", "SourceClub_Price"]
+    ].to_dict("records")
+    prompt = {
+        "task": "Choose the best SourceClub catalog match for a dental supply purchase-history line. Return JSON only.",
+        "purchase_line": {
+            "vendor_item_number": row.get("Vendor_Item_Number", ""),
+            "manufacturer": row.get("Manufacturer", ""),
+            "description": row.get("Description", ""),
+            "current_unit_price": row.get("Current_Unit_Price", ""),
+            "quantity": row.get("Quantity", ""),
+        },
+        "catalog_options": catalog_options,
+        "json_schema": {
+            "sourceclub_item_name": "string or empty string",
+            "confidence": "number from 0 to 1",
+            "reason": "short explanation",
+        },
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": "You are a careful dental supply matching assistant. Return compact valid JSON only.",
+                    },
+                    {"role": "user", "content": json.dumps(prompt)},
+                ],
+                "temperature": 0,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        text = payload.get("output_text", "")
+        if not text:
+            chunks = payload.get("output", [])
+            text = " ".join(
+                part.get("text", "")
+                for item in chunks
+                for part in item.get("content", [])
+                if isinstance(part, dict)
+            )
+        parsed = json.loads(text.strip())
+        if not parsed.get("sourceclub_item_name"):
+            return None
+        return parsed
+    except Exception:
+        return None
+
+
 def match_items(history: pd.DataFrame, catalog: pd.DataFrame) -> pd.DataFrame:
     if history.empty:
         return history
 
     matched_rows = []
+    memory = load_match_memory()
     for _, row in history.iterrows():
+        remembered = memory.get(memory_key(row))
+        if remembered:
+            current_price = float(row["Current_Unit_Price"])
+            quantity = float(row["Quantity"])
+            source_price = float(remembered["SourceClub_Price"])
+            matched_rows.append(
+                {
+                    **row.to_dict(),
+                    "Suggested_SourceClub_Match": remembered["SourceClub_Item_Name"],
+                    "SourceClub_Manufacturer_SKU": remembered["Manufacturer_SKU"],
+                    "SourceClub_Price": source_price,
+                    "Match_Status": "Matched",
+                    "Match_Confidence": 1.0,
+                    "Confidence_Band": "High",
+                    "Match_Reason": "Approved match memory",
+                    "Current_Spend": current_price * quantity,
+                    "SourceClub_Spend": source_price * quantity,
+                    "Projected_Savings": (current_price - source_price) * quantity,
+                }
+            )
+            continue
+
         ranked = []
         for _, catalog_row in catalog.iterrows():
             score, reason = score_catalog_match(row, catalog_row)
             ranked.append((score, reason, catalog_row))
         ranked.sort(key=lambda item: item[0], reverse=True)
         best_score, best_reason, best = ranked[0]
+
+        ai_suggestion = ai_match_suggestion(row, catalog) if best_score < 0.78 else None
+        if ai_suggestion:
+            ai_match = catalog[catalog["SourceClub_Item_Name"] == ai_suggestion.get("sourceclub_item_name")]
+            ai_confidence = float(ai_suggestion.get("confidence", 0))
+            if not ai_match.empty and ai_confidence > best_score:
+                best = ai_match.iloc[0]
+                best_score = min(ai_confidence, 1.0)
+                best_reason = f"AI-assisted suggestion: {ai_suggestion.get('reason', 'closest product match')}"
 
         if best_score >= 0.78:
             status = "Matched"
@@ -632,6 +920,39 @@ def build_pdf(metadata: dict[str, str], final: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def hubspot_payload(metadata: dict[str, str], final: pd.DataFrame, review_count: int) -> dict[str, Any]:
+    return {
+        "properties": {
+            get_config("HUBSPOT_PROP_LAST_ANALYSIS", "sourceclub_last_analysis_date"): date.today().isoformat(),
+            get_config("HUBSPOT_PROP_SUPPLIER", "sourceclub_current_supplier"): metadata.get("Supplier", ""),
+            get_config("HUBSPOT_PROP_CURRENT_SPEND", "sourceclub_current_spend"): round(float(final["Current_Spend"].sum()), 2),
+            get_config("HUBSPOT_PROP_SOURCECLUB_SPEND", "sourceclub_projected_sourceclub_spend"): round(float(final["SourceClub_Spend"].sum()), 2),
+            get_config("HUBSPOT_PROP_SAVINGS", "sourceclub_projected_savings"): round(float(final["Projected_Savings"].sum()), 2),
+            get_config("HUBSPOT_PROP_REVIEW_COUNT", "sourceclub_review_item_count"): int(review_count),
+        }
+    }
+
+
+def push_hubspot_company_update(metadata: dict[str, str], final: pd.DataFrame, review_count: int) -> tuple[bool, str]:
+    token = get_config("HUBSPOT_PRIVATE_APP_TOKEN", "")
+    company_id = get_config("HUBSPOT_COMPANY_ID", "")
+    if not token or not company_id:
+        return False, "Add HUBSPOT_PRIVATE_APP_TOKEN and HUBSPOT_COMPANY_ID to enable the HubSpot push."
+    if not REQUESTS_AVAILABLE:
+        return False, "The requests package is unavailable."
+
+    url = f"https://api.hubapi.com/crm/v3/objects/companies/{company_id}"
+    response = requests.patch(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=hubspot_payload(metadata, final, review_count),
+        timeout=20,
+    )
+    if response.ok:
+        return True, "HubSpot company record updated."
+    return False, f"HubSpot update failed: {response.status_code} {response.text[:300]}"
+
+
 def run_pipeline(raw: pd.DataFrame, catalog: pd.DataFrame):
     cleaned, metadata = clean_purchase_history(raw)
     aggregated = aggregate_history(cleaned)
@@ -641,6 +962,14 @@ def run_pipeline(raw: pd.DataFrame, catalog: pd.DataFrame):
 
 st.title("SourceClub Savings Analysis Automation")
 st.caption("Built around the real Benco workflow: messy purchase-history export in, matched PDF and spreadsheet out.")
+
+with st.sidebar:
+    st.header("Production Controls")
+    st.caption("These features are live when their environment variables are configured.")
+    st.write("Login:", "Enabled" if get_config("APP_USERNAME", "") else "Demo mode")
+    st.write("Match memory:", f"SQLite ({DB_PATH})")
+    st.write("AI matching:", "Enabled" if get_config("OPENAI_API_KEY", "") else "Off")
+    st.write("HubSpot push:", "Enabled" if get_config("HUBSPOT_PRIVATE_APP_TOKEN", "") else "Off")
 
 catalog = st.data_editor(
     CATALOG,
@@ -957,5 +1286,38 @@ download_cols[2].download_button(
     file_name="cleaned_purchase_history.csv",
     mime="text/csv",
 )
+
+st.subheader("5. Production actions")
+prod_cols = st.columns(3)
+if prod_cols[0].button("Save approved matches to memory", type="primary"):
+    saved = save_approved_matches(final, st.session_state.get("username", "demo-user"))
+    save_analysis_run(metadata, final, review_count)
+    st.success(f"Saved {saved} approved match(es) to persistent match memory.")
+
+with prod_cols[1]:
+    if st.button("Preview HubSpot payload"):
+        st.json(hubspot_payload(metadata, final, review_count))
+
+with prod_cols[2]:
+    if st.button("Push summary to HubSpot"):
+        ok, message = push_hubspot_company_update(metadata, final, review_count)
+        if ok:
+            st.success(message)
+        else:
+            st.warning(message)
+
+with st.expander("Production setup notes"):
+    st.markdown(
+        """
+        Configure these environment variables in Render when you want production behavior:
+
+        - `APP_USERNAME` and `APP_PASSWORD` or `APP_PASSWORD_HASH` for login.
+        - `OPENAI_API_KEY` and optional `OPENAI_MODEL` for AI-assisted low-confidence matching.
+        - `HUBSPOT_PRIVATE_APP_TOKEN`, `HUBSPOT_COMPANY_ID`, and optional custom property-name variables for HubSpot updates.
+        - `SOURCECLUB_DB_PATH` if the database should live somewhere other than the default SQLite file.
+
+        In a full deployment, the SQLite database should move to Postgres so match memory survives service rebuilds and supports multiple users safely.
+        """
+    )
 
 st.caption(f"Data source: {data_source}. Prototype assumes annual period if the vendor export covers the trailing 12 months.")
