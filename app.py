@@ -1,1323 +1,867 @@
-from __future__ import annotations
+"""
+Source Club — Savings Analysis Automation
+==========================================
+AI-powered dental supply savings analysis.
 
-import io
-import json
-import os
-import re
-import sqlite3
-from datetime import date
-from difflib import SequenceMatcher
-from hashlib import sha256
-from typing import Any
+Deploy on Render:
+  • Set env var  ANTHROPIC_API_KEY  in the Render dashboard.
+  • The app auto-loads it — reviewers never type a key.
+  • Demo results are pre-baked, so every tab is live on first load.
+"""
 
-import pandas as pd
+import os, json, io, time
+from datetime import datetime
+
 import streamlit as st
+import pandas as pd
+import anthropic
 
-try:
-    import requests
-
-    REQUESTS_AVAILABLE = True
-except Exception:
-    REQUESTS_AVAILABLE = False
-
-try:
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import landscape, letter
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib.units import inch
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-
-    REPORTLAB_AVAILABLE = True
-except Exception:
-    REPORTLAB_AVAILABLE = False
-
-
-DB_PATH = os.getenv("SOURCECLUB_DB_PATH", "sourceclub_match_memory.db")
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SourceClub Savings Analysis",
-    page_icon="SC",
+    page_title="Source Club | Savings Analysis",
+    page_icon="🦷",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1280px;}
-    h1, h2, h3 {letter-spacing: 0;}
-    div[data-testid="stMetricValue"] {font-size: 2rem;}
-    .small-note {color: #667085; font-size: 0.92rem; line-height: 1.45;}
-    .success-box {
-        border: 1px solid #b7e4c7; background: #f0fdf4; border-radius: 8px;
-        padding: 0.85rem 1rem; color: #14532d;
-    }
-    .review-box {
-        border: 1px solid #fedf89; background: #fffbeb; border-radius: 8px;
-        padding: 0.85rem 1rem; color: #7a2e0e;
-    }
-    .risk-box {
-        border: 1px solid #fecaca; background: #fff1f2; border-radius: 8px;
-        padding: 0.85rem 1rem; color: #7f1d1d;
-    }
-    .flow-card {
-        border: 1px solid #d0d5dd; background: #ffffff; border-radius: 10px;
-        padding: 1rem; min-height: 112px;
-    }
-    .flow-card strong {display: block; margin-bottom: 0.35rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-def get_config(name: str, default: str = "") -> str:
-    try:
-        value = st.secrets.get(name)
-        if value is not None:
-            return str(value)
-    except Exception:
-        pass
-    return os.getenv(name, default)
-
-
-def password_hash(value: str) -> str:
-    return sha256(value.encode("utf-8")).hexdigest()
-
-
-def check_login() -> None:
-    configured_user = get_config("APP_USERNAME", "")
-    configured_password_hash = get_config("APP_PASSWORD_HASH", "")
-    configured_password = get_config("APP_PASSWORD", "")
-
-    if not configured_user and not configured_password_hash and not configured_password:
-        st.sidebar.info("Demo mode: add APP_USERNAME and APP_PASSWORD in Render to require login.")
-        return
-
-    if st.session_state.get("authenticated"):
-        with st.sidebar:
-            st.success(f"Signed in as {st.session_state.get('username', configured_user)}")
-            if st.button("Sign out"):
-                st.session_state.clear()
-                st.rerun()
-        return
-
-    st.title("SourceClub Savings Analysis Automation")
-    st.caption("Sign in to access the savings-analysis workspace.")
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in", type="primary")
-
-    expected_hash = configured_password_hash or password_hash(configured_password)
-    if submitted:
-        if username == configured_user and password_hash(password) == expected_hash:
-            st.session_state["authenticated"] = True
-            st.session_state["username"] = username
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
-    st.stop()
-
-
-def db_connect() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH)
-
-
-def init_db() -> None:
-    with db_connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS match_memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                supplier TEXT NOT NULL,
-                vendor_item_number TEXT NOT NULL,
-                manufacturer TEXT,
-                description TEXT,
-                sourceclub_item_name TEXT NOT NULL,
-                sourceclub_manufacturer_sku TEXT,
-                sourceclub_price REAL NOT NULL,
-                reviewer TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(supplier, vendor_item_number, manufacturer, description)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS analysis_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prospect TEXT,
-                supplier TEXT,
-                current_spend REAL,
-                sourceclub_spend REAL,
-                projected_savings REAL,
-                review_count INTEGER,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-
-def memory_key(row: pd.Series) -> tuple[str, str, str, str]:
-    return (
-        normalize(row.get("Supplier", "")),
-        normalize(row.get("Vendor_Item_Number", "")),
-        normalize(row.get("Manufacturer", "")),
-        normalize(row.get("Description", "")),
-    )
-
-
-def load_match_memory() -> dict[tuple[str, str, str, str], dict[str, Any]]:
-    init_db()
-    with db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT supplier, vendor_item_number, manufacturer, description,
-                   sourceclub_item_name, sourceclub_manufacturer_sku, sourceclub_price
-            FROM match_memory
-            """
-        ).fetchall()
-    return {
-        (supplier, item, manufacturer, description): {
-            "SourceClub_Item_Name": sourceclub_item,
-            "Manufacturer_SKU": sourceclub_sku,
-            "SourceClub_Price": sourceclub_price,
-        }
-        for supplier, item, manufacturer, description, sourceclub_item, sourceclub_sku, sourceclub_price in rows
-    }
-
-
-def save_approved_matches(final: pd.DataFrame, reviewer: str = "") -> int:
-    if final.empty:
-        return 0
-    init_db()
-    saved = 0
-    approved = final[final["Match_Status"].isin(["Matched", "Reviewed Match", "Reviewed Price"])]
-    with db_connect() as conn:
-        for _, row in approved.iterrows():
-            if not row.get("Suggested_SourceClub_Match") or pd.isna(row.get("SourceClub_Price")):
-                continue
-            conn.execute(
-                """
-                INSERT INTO match_memory (
-                    supplier, vendor_item_number, manufacturer, description,
-                    sourceclub_item_name, sourceclub_manufacturer_sku, sourceclub_price, reviewer
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(supplier, vendor_item_number, manufacturer, description)
-                DO UPDATE SET
-                    sourceclub_item_name=excluded.sourceclub_item_name,
-                    sourceclub_manufacturer_sku=excluded.sourceclub_manufacturer_sku,
-                    sourceclub_price=excluded.sourceclub_price,
-                    reviewer=excluded.reviewer,
-                    created_at=CURRENT_TIMESTAMP
-                """,
-                (
-                    normalize(row.get("Supplier", "")),
-                    normalize(row.get("Vendor_Item_Number", "")),
-                    normalize(row.get("Manufacturer", "")),
-                    normalize(row.get("Description", "")),
-                    row.get("Suggested_SourceClub_Match"),
-                    row.get("SourceClub_Manufacturer_SKU", ""),
-                    float(row.get("SourceClub_Price", 0)),
-                    reviewer,
-                ),
-            )
-            saved += 1
-    return saved
-
-
-def save_analysis_run(metadata: dict[str, str], final: pd.DataFrame, review_count: int) -> None:
-    init_db()
-    with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO analysis_runs (prospect, supplier, current_spend, sourceclub_spend, projected_savings, review_count)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                metadata.get("Prepared For", ""),
-                metadata.get("Supplier", ""),
-                float(final["Current_Spend"].sum()) if not final.empty else 0,
-                float(final["SourceClub_Spend"].sum()) if not final.empty else 0,
-                float(final["Projected_Savings"].sum()) if not final.empty else 0,
-                int(review_count),
-            ),
-        )
-
-
-init_db()
-check_login()
-
-
-CATALOG = pd.DataFrame(
-    [
-        {
-            "SourceClub_Item_Name": "GRAHAM LIDOCAINE 1:100 RED 50",
-            "Manufacturer": "Benco",
-            "Manufacturer_SKU": "3306-638",
-            "Pack_Size": 50,
-            "Unit": "Box",
-            "SourceClub_Price": 28.75,
-            "Category": "Anesthetic",
-        },
-        {
-            "SourceClub_Item_Name": "GRAHAM MEPIVACAINE 3% BX50",
-            "Manufacturer": "Benco",
-            "Manufacturer_SKU": "3306-656",
-            "Pack_Size": 50,
-            "Unit": "Box",
-            "SourceClub_Price": 32.50,
-            "Category": "Anesthetic",
-        },
-        {
-            "SourceClub_Item_Name": "ORABLOC 4% W/EPI 1:100 GLD 50",
-            "Manufacturer": "Pierrel",
-            "Manufacturer_SKU": "4707-113",
-            "Pack_Size": 50,
-            "Unit": "Box",
-            "SourceClub_Price": 35.00,
-            "Category": "Anesthetic",
-        },
-        {
-            "SourceClub_Item_Name": "NITRILE EXAM GLOVES POWDER FREE MEDIUM",
-            "Manufacturer": "Medline",
-            "Manufacturer_SKU": "GLV-MED-NIT",
-            "Pack_Size": 100,
-            "Unit": "Box",
-            "SourceClub_Price": 8.50,
-            "Category": "Gloves",
-        },
-        {
-            "SourceClub_Item_Name": "FACE MASKS ASTM LEVEL 3 EARLOOP",
-            "Manufacturer": "Medline",
-            "Manufacturer_SKU": "MASK-L3",
-            "Pack_Size": 50,
-            "Unit": "Box",
-            "SourceClub_Price": 12.99,
-            "Category": "Masks",
-        },
-        {
-            "SourceClub_Item_Name": "SURGICAL GOWNS FLUID RESISTANT",
-            "Manufacturer": "Cardinal",
-            "Manufacturer_SKU": "GOWN-FR",
-            "Pack_Size": 10,
-            "Unit": "Each",
-            "SourceClub_Price": 45.00,
-            "Category": "PPE",
-        },
-    ]
-)
-
-
-def money(value: Any) -> str:
-    try:
-        return f"${float(value):,.2f}"
-    except Exception:
-        return "$0.00"
-
-
-def number(value: Any) -> float:
-    if pd.isna(value):
-        return 0.0
-    cleaned = re.sub(r"[^0-9.\-]", "", str(value))
-    if cleaned in {"", ".", "-", "-."}:
-        return 0.0
-    try:
-        return float(cleaned)
-    except ValueError:
-        return 0.0
-
-
-def normalize(value: Any) -> str:
-    text = str(value or "").lower()
-    text = re.sub(r"[^a-z0-9.% ]+", " ", text)
-    text = re.sub(
-        r"\b(box|bx|bag|pack|pkg|case|of|with|and|the|each|ea|ct|count|red|blue|clear)\b",
-        " ",
-        text,
-    )
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def token_overlap(left: str, right: str) -> float:
-    left_tokens = set(normalize(left).split())
-    right_tokens = set(normalize(right).split())
-    if not left_tokens or not right_tokens:
-        return 0.0
-    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
-
-
-def similarity(left: str, right: str) -> float:
-    return SequenceMatcher(None, normalize(left), normalize(right)).ratio()
-
-
-def confidence_band(score: float) -> str:
-    if score >= 0.78:
-        return "High"
-    if score >= 0.55:
-        return "Medium"
-    return "Low"
-
-
-def extract_metadata(raw: pd.DataFrame) -> dict[str, str]:
-    metadata = {
-        "Prepared For": "Unknown prospect",
-        "Account Number": "",
-        "Report Description": "",
-        "Supplier": "Benco Dental",
-    }
-    scan_rows = raw.head(30).fillna("").astype(str).values.tolist()
-    for row in scan_rows:
-        joined = " ".join(cell.strip() for cell in row if cell.strip())
-        cells = [cell.strip() for cell in row if cell.strip()]
-        for idx, cell in enumerate(cells):
-            lower = cell.lower()
-            next_value = cells[idx + 1] if idx + 1 < len(cells) else ""
-            if "prepared for" in lower and next_value:
-                metadata["Prepared For"] = next_value
-            if "account number" in lower and next_value:
-                metadata["Account Number"] = next_value
-            if "report description" in lower and next_value:
-                metadata["Report Description"] = next_value
-        if "prepared for" in joined.lower():
-            match = re.search(r"prepared for:?\s+(.+?)(account number|$)", joined, re.I)
-            if match:
-                metadata["Prepared For"] = match.group(1).strip()
-        if "account number" in joined.lower():
-            match = re.search(r"account number:?\s+([0-9A-Za-z\-]+)", joined, re.I)
-            if match:
-                metadata["Account Number"] = match.group(1).strip()
-    return metadata
-
-
-HEADER_ALIASES = {
-    "order": "Order",
-    "order #": "Order",
-    "invoice": "Order",
-    "item": "Vendor_Item_Number",
-    "item number": "Vendor_Item_Number",
-    "item #": "Vendor_Item_Number",
-    "mfgr": "Manufacturer",
-    "mfg": "Manufacturer",
-    "manufacturer": "Manufacturer",
-    "description": "Description",
-    "item description": "Description",
-    "order date": "Order_Date",
-    "date": "Order_Date",
-    "price": "Current_Unit_Price",
-    "unit price": "Current_Unit_Price",
-    "qty": "Quantity",
-    "quantity": "Quantity",
-    "amount": "Current_Total",
-    "total": "Current_Total",
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+:root{
+  --primary:#1a56db;--success:#057a55;--warn:#c27803;
+  --danger:#c81e1e;--border:#e5e7eb;
 }
+/* Hero banner */
+.hero{background:linear-gradient(135deg,#1a56db 0%,#1e429f 100%);
+      color:#fff;padding:2rem 2.5rem;border-radius:14px;margin-bottom:1.5rem;}
+.hero h1{font-size:2rem;margin:0;font-weight:800;}
+.hero p{margin:.4rem 0 0;opacity:.85;font-size:1.05rem;}
 
+/* Metric cards */
+.metric-row{display:flex;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap;}
+.metric-card{flex:1;min-width:140px;background:#fff;border:1px solid var(--border);
+             border-radius:10px;padding:1rem 1.2rem;text-align:center;
+             box-shadow:0 1px 4px rgba(0,0,0,.07);}
+.metric-card .val{font-size:1.75rem;font-weight:700;color:var(--primary);}
+.metric-card .lbl{font-size:.78rem;color:#6b7280;margin-top:2px;}
 
-REQUIRED_COLUMNS = [
-    "Order",
-    "Vendor_Item_Number",
-    "Manufacturer",
-    "Description",
-    "Order_Date",
-    "Current_Unit_Price",
-    "Quantity",
-    "Current_Total",
+/* Confidence badges */
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.78rem;font-weight:600;}
+.badge-high{background:#d1fae5;color:#065f46;}
+.badge-med {background:#fef3c7;color:#92400e;}
+.badge-low {background:#fee2e2;color:#991b1b;}
+.badge-none{background:#f3f4f6;color:#6b7280;}
+
+/* Section headings */
+.section-title{font-size:1.1rem;font-weight:700;margin:1.5rem 0 .75rem;
+               color:#111827;border-bottom:2px solid var(--primary);padding-bottom:4px;}
+
+/* Review cards */
+.review-card{background:#fff;border:1px solid var(--border);
+             border-radius:10px;padding:1rem 1.2rem;margin-bottom:.75rem;}
+.review-card.flagged{border-left:4px solid #f59e0b;}
+
+/* Big savings callout */
+.savings-hero{background:linear-gradient(135deg,#057a55,#046c4e);color:#fff;
+              padding:1.75rem 2rem;border-radius:14px;text-align:center;margin:1rem 0;}
+.savings-hero .big{font-size:3.2rem;font-weight:800;}
+.savings-hero .sub{font-size:1rem;opacity:.85;margin-top:4px;}
+
+/* Prospect one-pager */
+.prospect-card{background:#fff;border:2px solid var(--primary);border-radius:14px;
+               padding:2rem 2.5rem;box-shadow:0 4px 16px rgba(0,0,0,.10);}
+.prospect-card h2{margin:0 0 .25rem;font-size:1.6rem;color:#111827;}
+.prospect-card .sub-h{color:#6b7280;font-size:.95rem;margin-bottom:1.5rem;}
+.save-pill{display:inline-block;background:#d1fae5;color:#065f46;
+           font-weight:700;font-size:1.1rem;padding:.35rem 1.1rem;border-radius:999px;}
+.prospect-table{width:100%;border-collapse:collapse;font-size:.88rem;margin-top:.75rem;}
+.prospect-table th{background:#f3f4f6;padding:.5rem .75rem;text-align:left;
+                   border-bottom:2px solid var(--border);font-weight:600;}
+.prospect-table td{padding:.45rem .75rem;border-bottom:1px solid var(--border);}
+.prospect-table tr:last-child td{border-bottom:none;}
+.green{color:#057a55;font-weight:600;}
+
+/* Arch box */
+.arch-box{background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px;
+          padding:1.2rem 1.5rem;font-size:.9rem;line-height:1.8;}
+
+/* Demo banner */
+.demo-banner{background:#fffbeb;border:1px solid #fde68a;border-radius:8px;
+             padding:.75rem 1rem;margin-bottom:1rem;font-size:.9rem;color:#92400e;}
+
+#MainMenu,footer{visibility:hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAMPLE DATA
+# ─────────────────────────────────────────────────────────────────────────────
+SAMPLE_PROSPECT = pd.DataFrame([
+    {"Item Description":"Nitrile Exam Gloves Medium Powder Free 100/box", "SKU":"HEN-MD-100",    "Unit Price":8.50,  "Qty/Month":20,"Supplier":"Henry Schein"},
+    {"Item Description":"Nitrile Gloves Large PF Box 100ct",              "SKU":"PAT-LG-NIT",    "Unit Price":9.10,  "Qty/Month":15,"Supplier":"Patterson"},
+    {"Item Description":"Prophy Paste Medium Grit Mint 200/box",          "SKU":"ULT-PPM-200",   "Unit Price":42.00, "Qty/Month":4, "Supplier":"Ultradent"},
+    {"Item Description":"Dental Floss Waxed 200m",                        "SKU":"ORB-FLW-200",   "Unit Price":3.20,  "Qty/Month":30,"Supplier":"Oral-B"},
+    {"Item Description":"3M ESPE Clinpro 5000 Toothpaste 113g",           "SKU":"3M-CP5000",     "Unit Price":14.75, "Qty/Month":8, "Supplier":"3M"},
+    {"Item Description":"Cavitron Inserts 30K FSI-1000",                  "SKU":"DEN-CAV-30K",   "Unit Price":28.00, "Qty/Month":2, "Supplier":"Dentsply"},
+    {"Item Description":"Disposable Saliva Ejectors Blue 100/bag",        "SKU":"MCK-SEJ-100",   "Unit Price":4.50,  "Qty/Month":10,"Supplier":"McKesson"},
+    {"Item Description":"Autoclave Sterilization Pouches 3.5x9 200/box",  "SKU":"MDT-POUCH-200", "Unit Price":18.00, "Qty/Month":5, "Supplier":"Medline"},
+    {"Item Description":"Dental Bibs 13x18 2ply 500/case",                "SKU":"HEN-BIB-500",   "Unit Price":22.00, "Qty/Month":3, "Supplier":"Henry Schein"},
+    {"Item Description":"Fluoride Varnish 5% NaF 0.4mL 35/box",          "SKU":"COLT-FV-35",    "Unit Price":65.00, "Qty/Month":2, "Supplier":"Colgate"},
+])
+
+SAMPLE_CATALOG = pd.DataFrame([
+    {"Product Name":"Sempermed Nitrile Exam Gloves Medium PF 100ct",       "SC_SKU":"SC-NIT-M100",  "Source Club Price":5.80},
+    {"Product Name":"Sempermed Nitrile Gloves Large Powder-Free Box/100",  "SC_SKU":"SC-NIT-L100",  "Source Club Price":6.10},
+    {"Product Name":"Young Innovations Prophy Paste Medium Mint 200pk",    "SC_SKU":"SC-PP-MED-200","Source Club Price":28.50},
+    {"Product Name":"GUM Waxed Dental Floss 200 meter",                    "SC_SKU":"SC-FLW-200M",  "Source Club Price":1.95},
+    {"Product Name":"Clinpro 5000 Anti-Cavity Toothpaste 4oz (113g)",      "SC_SKU":"SC-3M-CP5K",   "Source Club Price":10.20},
+    {"Product Name":"Dentsply Cavitron 30K Insert FSI-1000 Tip",           "SC_SKU":"SC-CAV-FSI30", "Source Club Price":19.50},
+    {"Product Name":"Saliva Ejectors Disposable Blue 100/pk",              "SC_SKU":"SC-SALEJ-100", "Source Club Price":2.80},
+    {"Product Name":"Sterilization Pouches Self-Seal 3.5x9 in 200ct",      "SC_SKU":"SC-STER-P200", "Source Club Price":11.00},
+    {"Product Name":"Tidi Patient Bibs 13x18 2-ply 500/cs",                "SC_SKU":"SC-BIB-500CS", "Source Club Price":14.50},
+    {"Product Name":"Colgate PreviDent Fluoride Varnish 5% NaF 35/bx",    "SC_SKU":"SC-FV-5PCT",   "Source Club Price":44.00},
+    {"Product Name":"Latex Exam Gloves Medium Powdered 100ct",             "SC_SKU":"SC-LAT-M100",  "Source Club Price":4.20},
+    {"Product Name":"Cotton Rolls #2 Medium 2000/case",                    "SC_SKU":"SC-CR-MED-2K", "Source Club Price":16.00},
+])
+
+# Pre-baked demo matches — shown instantly, no API call needed
+DEMO_MATCHES = [
+    {"idx":0,"description":"Nitrile Exam Gloves Medium Powder Free 100/box","sku":"HEN-MD-100","supplier":"Henry Schein","their_price":8.50,"qty_per_month":20,"sc_sku":"SC-NIT-M100","matched_name":"Sempermed Nitrile Exam Gloves Medium PF 100ct","sc_price":5.80,"confidence":96,"reasoning":"Same type, size, pack qty. Brand substitution only — Sempermed is a recognized equivalent.","pack_size_note":"same"},
+    {"idx":1,"description":"Nitrile Gloves Large PF Box 100ct","sku":"PAT-LG-NIT","supplier":"Patterson","their_price":9.10,"qty_per_month":15,"sc_sku":"SC-NIT-L100","matched_name":"Sempermed Nitrile Gloves Large Powder-Free Box/100","sc_price":6.10,"confidence":95,"reasoning":"Identical type, size (Large), pack size (100), and PF spec.","pack_size_note":"same"},
+    {"idx":2,"description":"Prophy Paste Medium Grit Mint 200/box","sku":"ULT-PPM-200","supplier":"Ultradent","their_price":42.00,"qty_per_month":4,"sc_sku":"SC-PP-MED-200","matched_name":"Young Innovations Prophy Paste Medium Mint 200pk","sc_price":28.50,"confidence":88,"reasoning":"Same grit and flavor, same pack count. Different manufacturer — flagged for review.","pack_size_note":"same"},
+    {"idx":3,"description":"Dental Floss Waxed 200m","sku":"ORB-FLW-200","supplier":"Oral-B","their_price":3.20,"qty_per_month":30,"sc_sku":"SC-FLW-200M","matched_name":"GUM Waxed Dental Floss 200 meter","sc_price":1.95,"confidence":93,"reasoning":"Same wax type and exact length (200m). GUM is a standard clinical equivalent.","pack_size_note":"same"},
+    {"idx":4,"description":"3M ESPE Clinpro 5000 Toothpaste 113g","sku":"3M-CP5000","supplier":"3M","their_price":14.75,"qty_per_month":8,"sc_sku":"SC-3M-CP5K","matched_name":"Clinpro 5000 Anti-Cavity Toothpaste 4oz (113g)","sc_price":10.20,"confidence":99,"reasoning":"Same product — 113g = 4oz confirmed. Source Club has negotiated pricing direct with 3M.","pack_size_note":"same"},
+    {"idx":5,"description":"Cavitron Inserts 30K FSI-1000","sku":"DEN-CAV-30K","supplier":"Dentsply","their_price":28.00,"qty_per_month":2,"sc_sku":"SC-CAV-FSI30","matched_name":"Dentsply Cavitron 30K Insert FSI-1000 Tip","sc_price":19.50,"confidence":99,"reasoning":"Exact same product, manufacturer, and model number. Direct catalog match.","pack_size_note":"same"},
+    {"idx":6,"description":"Disposable Saliva Ejectors Blue 100/bag","sku":"MCK-SEJ-100","supplier":"McKesson","their_price":4.50,"qty_per_month":10,"sc_sku":"SC-SALEJ-100","matched_name":"Saliva Ejectors Disposable Blue 100/pk","sc_price":2.80,"confidence":94,"reasoning":"Same color and quantity. 'bag' vs 'pk' is identical packaging terminology.","pack_size_note":"same"},
+    {"idx":7,"description":"Autoclave Sterilization Pouches 3.5x9 200/box","sku":"MDT-POUCH-200","supplier":"Medline","their_price":18.00,"qty_per_month":5,"sc_sku":"SC-STER-P200","matched_name":"Sterilization Pouches Self-Seal 3.5x9 in 200ct","sc_price":11.00,"confidence":92,"reasoning":"Same dimensions (3.5×9 in), same count (200), self-seal autoclave type.","pack_size_note":"same"},
+    {"idx":8,"description":"Dental Bibs 13x18 2ply 500/case","sku":"HEN-BIB-500","supplier":"Henry Schein","their_price":22.00,"qty_per_month":3,"sc_sku":"SC-BIB-500CS","matched_name":"Tidi Patient Bibs 13x18 2-ply 500/cs","sc_price":14.50,"confidence":97,"reasoning":"Same dimensions (13×18), same ply (2-ply), same case count (500). Tidi is industry-standard.","pack_size_note":"same"},
+    {"idx":9,"description":"Fluoride Varnish 5% NaF 0.4mL 35/box","sku":"COLT-FV-35","supplier":"Colgate","their_price":65.00,"qty_per_month":2,"sc_sku":"SC-FV-5PCT","matched_name":"Colgate PreviDent Fluoride Varnish 5% NaF 35/bx","sc_price":44.00,"confidence":99,"reasoning":"Same manufacturer, same concentration (5% NaF), same unit dose size (0.4mL), same count (35).","pack_size_note":"same"},
 ]
 
-
-def canonical_header(value: Any) -> str | None:
-    cleaned = normalize(value).replace(" ", " ")
-    return HEADER_ALIASES.get(cleaned)
-
-
-def find_vendor_rows(raw: pd.DataFrame) -> pd.DataFrame:
-    rows = raw.fillna("").astype(str).values.tolist()
-    records: list[dict[str, str]] = []
-    active_map: dict[int, str] | None = None
-
-    for row in rows:
-        mapped = {idx: canonical_header(cell) for idx, cell in enumerate(row)}
-        mapped = {idx: name for idx, name in mapped.items() if name}
-        mapped_values = set(mapped.values())
-        if {"Order", "Vendor_Item_Number", "Description", "Current_Unit_Price", "Quantity"} <= mapped_values:
-            active_map = mapped
-            continue
-
-        if not active_map:
-            continue
-
-        record = {column: "" for column in REQUIRED_COLUMNS}
-        for idx, column in active_map.items():
-            if idx < len(row):
-                record[column] = row[idx].strip()
-
-        joined = " ".join(record.values()).lower()
-        if not any(record.values()):
-            continue
-        if "total for" in joined or "purchase analysis" in joined:
-            continue
-        if normalize(record["Order"]) in {"order", ""}:
-            continue
-        if normalize(record["Vendor_Item_Number"]) in {"item", ""}:
-            continue
-        if not record["Description"] or not record["Quantity"]:
-            continue
-        records.append(record)
-
-    return pd.DataFrame(records, columns=REQUIRED_COLUMNS)
-
-
-def clean_purchase_history(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
-    metadata = extract_metadata(raw)
-
-    if set(REQUIRED_COLUMNS) <= set(raw.columns):
-        cleaned = raw[REQUIRED_COLUMNS].copy()
-    else:
-        direct_columns = {canonical_header(column): column for column in raw.columns if canonical_header(column)}
-        if {"Order", "Vendor_Item_Number", "Description", "Current_Unit_Price", "Quantity"} <= set(direct_columns):
-            cleaned = pd.DataFrame()
-            for target in REQUIRED_COLUMNS:
-                source = direct_columns.get(target)
-                cleaned[target] = raw[source] if source else ""
-        else:
-            cleaned = find_vendor_rows(raw)
-
-    if cleaned.empty:
-        return cleaned, metadata
-
-    if "Supplier" in raw.columns and not raw["Supplier"].dropna().empty:
-        metadata["Supplier"] = str(raw["Supplier"].dropna().iloc[0])
-
-    cleaned["Supplier"] = metadata["Supplier"]
-    cleaned["Current_Unit_Price"] = cleaned["Current_Unit_Price"].map(number)
-    cleaned["Quantity"] = cleaned["Quantity"].map(number)
-    cleaned["Current_Total"] = cleaned["Current_Total"].map(number)
-    cleaned.loc[cleaned["Current_Total"] == 0, "Current_Total"] = (
-        cleaned["Current_Unit_Price"] * cleaned["Quantity"]
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE
+# ─────────────────────────────────────────────────────────────────────────────
+def _init():
+    defaults = dict(
+        matches=DEMO_MATCHES.copy(),   # pre-loaded so every tab works on open
+        reviewed={},
+        edited_price={},
+        analysis_done=True,            # demo is already "run"
+        demo_mode=True,                # flag shown in UI
+        prospect_df=SAMPLE_PROSPECT.copy(),
+        catalog_df=SAMPLE_CATALOG.copy(),
+        prospect_name="Valley Dental Group",
     )
-    cleaned = cleaned[cleaned["Quantity"] > 0].copy()
-    cleaned["Prospect_Item_Name"] = (
-        cleaned["Manufacturer"].astype(str).str.strip()
-        + " "
-        + cleaned["Description"].astype(str).str.strip()
-    ).str.strip()
-    return cleaned.reset_index(drop=True), metadata
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-def aggregate_history(cleaned: pd.DataFrame) -> pd.DataFrame:
-    if cleaned.empty:
-        return cleaned
-    grouped = (
-        cleaned.groupby(["Supplier", "Vendor_Item_Number", "Manufacturer", "Description"], dropna=False)
-        .agg(
-            Quantity=("Quantity", "sum"),
-            Current_Total=("Current_Total", "sum"),
-            Orders=("Order", "nunique"),
-            First_Order_Date=("Order_Date", "min"),
-            Last_Order_Date=("Order_Date", "max"),
-        )
-        .reset_index()
-    )
-    grouped["Current_Unit_Price"] = grouped["Current_Total"] / grouped["Quantity"]
-    grouped["Prospect_Item_Name"] = (
-        grouped["Manufacturer"].astype(str).str.strip()
-        + " "
-        + grouped["Description"].astype(str).str.strip()
-    ).str.strip()
-    return grouped
+_init()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# API KEY  — env var first, sidebar fallback
+# ─────────────────────────────────────────────────────────────────────────────
+ENV_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+if "api_key" not in st.session_state:
+    st.session_state.api_key = ENV_KEY
 
-def score_catalog_match(row: pd.Series, catalog_row: pd.Series) -> tuple[float, str]:
-    reasons = []
-    prospect_name = f"{row.get('Manufacturer', '')} {row.get('Description', '')} {row.get('Vendor_Item_Number', '')}"
-    source_name = (
-        f"{catalog_row['Manufacturer']} {catalog_row['SourceClub_Item_Name']} "
-        f"{catalog_row['Manufacturer_SKU']}"
-    )
-
-    sku_exact = normalize(row.get("Vendor_Item_Number")) == normalize(catalog_row["Manufacturer_SKU"])
-    manufacturer_exact = normalize(row.get("Manufacturer")) == normalize(catalog_row["Manufacturer"])
-    text_score = similarity(prospect_name, source_name)
-    token_score = token_overlap(prospect_name, source_name)
-
-    score = (0.45 * text_score) + (0.35 * token_score)
-    if sku_exact:
-        score += 0.35
-        reasons.append("Strong SKU match")
-    if manufacturer_exact:
-        score += 0.12
-        reasons.append("manufacturer match")
-    if token_score >= 0.45:
-        reasons.append("shared product terms")
-    if text_score >= 0.72:
-        reasons.append("strong description match")
-
-    final_score = min(score, 1.0)
-    if final_score < 0.55:
-        return final_score, "Needs review: weak description/SKU signal"
-    if final_score < 0.78:
-        return final_score, "Partial match: " + (", ".join(reasons) or "closest description match")
-    return final_score, ", ".join(reasons) or "Strong description match"
-
-
-def ai_match_suggestion(row: pd.Series, catalog: pd.DataFrame) -> dict[str, Any] | None:
-    api_key = get_config("OPENAI_API_KEY", "")
-    model = get_config("OPENAI_MODEL", "gpt-4.1-mini")
-    if not api_key or not REQUESTS_AVAILABLE:
-        return None
-
-    catalog_options = catalog[
-        ["SourceClub_Item_Name", "Manufacturer", "Manufacturer_SKU", "Pack_Size", "Unit", "SourceClub_Price"]
-    ].to_dict("records")
-    prompt = {
-        "task": "Choose the best SourceClub catalog match for a dental supply purchase-history line. Return JSON only.",
-        "purchase_line": {
-            "vendor_item_number": row.get("Vendor_Item_Number", ""),
-            "manufacturer": row.get("Manufacturer", ""),
-            "description": row.get("Description", ""),
-            "current_unit_price": row.get("Current_Unit_Price", ""),
-            "quantity": row.get("Quantity", ""),
-        },
-        "catalog_options": catalog_options,
-        "json_schema": {
-            "sourceclub_item_name": "string or empty string",
-            "confidence": "number from 0 to 1",
-            "reason": "short explanation",
-        },
-    }
-
-    try:
-        response = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "input": [
-                    {
-                        "role": "system",
-                        "content": "You are a careful dental supply matching assistant. Return compact valid JSON only.",
-                    },
-                    {"role": "user", "content": json.dumps(prompt)},
-                ],
-                "temperature": 0,
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        text = payload.get("output_text", "")
-        if not text:
-            chunks = payload.get("output", [])
-            text = " ".join(
-                part.get("text", "")
-                for item in chunks
-                for part in item.get("content", [])
-                if isinstance(part, dict)
-            )
-        parsed = json.loads(text.strip())
-        if not parsed.get("sourceclub_item_name"):
-            return None
-        return parsed
-    except Exception:
-        return None
-
-
-def match_items(history: pd.DataFrame, catalog: pd.DataFrame) -> pd.DataFrame:
-    if history.empty:
-        return history
-
-    matched_rows = []
-    memory = load_match_memory()
-    for _, row in history.iterrows():
-        remembered = memory.get(memory_key(row))
-        if remembered:
-            current_price = float(row["Current_Unit_Price"])
-            quantity = float(row["Quantity"])
-            source_price = float(remembered["SourceClub_Price"])
-            matched_rows.append(
-                {
-                    **row.to_dict(),
-                    "Suggested_SourceClub_Match": remembered["SourceClub_Item_Name"],
-                    "SourceClub_Manufacturer_SKU": remembered["Manufacturer_SKU"],
-                    "SourceClub_Price": source_price,
-                    "Match_Status": "Matched",
-                    "Match_Confidence": 1.0,
-                    "Confidence_Band": "High",
-                    "Match_Reason": "Approved match memory",
-                    "Current_Spend": current_price * quantity,
-                    "SourceClub_Spend": source_price * quantity,
-                    "Projected_Savings": (current_price - source_price) * quantity,
-                }
-            )
-            continue
-
-        ranked = []
-        for _, catalog_row in catalog.iterrows():
-            score, reason = score_catalog_match(row, catalog_row)
-            ranked.append((score, reason, catalog_row))
-        ranked.sort(key=lambda item: item[0], reverse=True)
-        best_score, best_reason, best = ranked[0]
-
-        ai_suggestion = ai_match_suggestion(row, catalog) if best_score < 0.78 else None
-        if ai_suggestion:
-            ai_match = catalog[catalog["SourceClub_Item_Name"] == ai_suggestion.get("sourceclub_item_name")]
-            ai_confidence = float(ai_suggestion.get("confidence", 0))
-            if not ai_match.empty and ai_confidence > best_score:
-                best = ai_match.iloc[0]
-                best_score = min(ai_confidence, 1.0)
-                best_reason = f"AI-assisted suggestion: {ai_suggestion.get('reason', 'closest product match')}"
-
-        if best_score >= 0.78:
-            status = "Matched"
-        elif best_score >= 0.55:
-            status = "Needs Review"
-        else:
-            status = "No Match"
-
-        current_price = float(row["Current_Unit_Price"])
-        quantity = float(row["Quantity"])
-        source_price = float(best["SourceClub_Price"]) if status != "No Match" else 0.0
-        current_spend = current_price * quantity
-        source_spend = source_price * quantity if status != "No Match" else 0.0
-
-        matched_rows.append(
-            {
-                **row.to_dict(),
-                "Suggested_SourceClub_Match": best["SourceClub_Item_Name"] if status != "No Match" else "",
-                "SourceClub_Manufacturer_SKU": best["Manufacturer_SKU"] if status != "No Match" else "",
-                "SourceClub_Price": source_price if status != "No Match" else None,
-                "Match_Status": status,
-                "Match_Confidence": round(best_score, 2),
-                "Confidence_Band": confidence_band(best_score),
-                "Match_Reason": best_reason if status != "No Match" else "Needs review: below confidence threshold",
-                "Current_Spend": current_spend,
-                "SourceClub_Spend": source_spend,
-                "Projected_Savings": current_spend - source_spend if status != "No Match" else 0.0,
-            }
-        )
-
-    return pd.DataFrame(matched_rows)
-
-
-def apply_manual_review(reviewed: pd.DataFrame, catalog: pd.DataFrame) -> pd.DataFrame:
-    result = reviewed.copy()
-    if "Reviewer_Selected_Match" not in result:
-        result["Reviewer_Selected_Match"] = ""
-    if "Reviewer_SourceClub_Price" not in result:
-        result["Reviewer_SourceClub_Price"] = None
-    catalog_lookup = catalog.set_index("SourceClub_Item_Name").to_dict("index")
-
-    for idx, row in result.iterrows():
-        selected = row.get("Reviewer_Selected_Match", "")
-        override_price = number(row.get("Reviewer_SourceClub_Price"))
-        if selected and selected in catalog_lookup:
-            item = catalog_lookup[selected]
-            source_price = override_price if override_price > 0 else float(item["SourceClub_Price"])
-            result.at[idx, "Suggested_SourceClub_Match"] = selected
-            result.at[idx, "SourceClub_Manufacturer_SKU"] = item["Manufacturer_SKU"]
-            result.at[idx, "SourceClub_Price"] = source_price
-            result.at[idx, "Match_Status"] = "Reviewed Match"
-            result.at[idx, "Match_Confidence"] = 1.0
-            result.at[idx, "Confidence_Band"] = "High"
-            result.at[idx, "Match_Reason"] = "Human approved override"
-            result.at[idx, "SourceClub_Spend"] = source_price * float(row["Quantity"])
-            result.at[idx, "Projected_Savings"] = float(row["Current_Spend"]) - result.at[idx, "SourceClub_Spend"]
-        current_source_price = number(row.get("SourceClub_Price"))
-        price_changed = override_price > 0 and abs(override_price - current_source_price) > 0.005
-        if not selected and price_changed and pd.notna(row.get("SourceClub_Price")):
-            result.at[idx, "SourceClub_Price"] = override_price
-            result.at[idx, "Match_Status"] = "Reviewed Price"
-            result.at[idx, "Match_Confidence"] = max(float(row.get("Match_Confidence", 0)), 0.78)
-            result.at[idx, "Confidence_Band"] = "High"
-            result.at[idx, "Match_Reason"] = "Human price override"
-            result.at[idx, "SourceClub_Spend"] = override_price * float(row["Quantity"])
-            result.at[idx, "Projected_Savings"] = float(row["Current_Spend"]) - result.at[idx, "SourceClub_Spend"]
-    return result
-
-
-def benco_demo_raw() -> pd.DataFrame:
-    rows = [
-        ["", "", "", "", "", "", "", "", ""],
-        ["Benco Dental", "", "", "", "", "Purchase Analysis:", "Item Detail", "", ""],
-        ["Prepared For:", "CAROLINA DTL ARTS OF GOLDSBORO", "", "", "Account Number:", "90293215", "", "", ""],
-        ["Report Description:", "This report includes All purchases between 8/4/2024 and 8/30/2025", "", "", "", "", "", "", ""],
-        ["", "", "", "", "", "", "", "", ""],
-        ["1200 ANESTHETIC & ACCESSORIES", "", "", "", "", "", "", "", ""],
-        ["Anesthetic - Lidocaines", "", "", "", "", "", "", "", ""],
-        ["Order", "Item", "Mfgr", "Description", "Order Date", "Price", "Qty", "Amount", ""],
-        ["BX900215", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "09/06/24", "$39.89", "2", "$79.78", ""],
-        ["BX935041", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "09/17/24", "$39.89", "2", "$79.78", ""],
-        ["BX994503", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "10/04/24", "$39.89", "2", "$79.78", ""],
-        ["BY080297", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "10/29/24", "$39.89", "2", "$79.78", ""],
-        ["BY124675", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "11/12/24", "$39.89", "1", "$39.89", ""],
-        ["BY470898", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "03/04/25", "$50.15", "1", "$50.15", ""],
-        ["BY518869", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "03/18/25", "$50.15", "2", "$100.30", ""],
-        ["BY752939", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "05/28/25", "$50.15", "2", "$100.30", ""],
-        ["BY793439", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "06/10/25", "$50.15", "1", "$50.15", ""],
-        ["BY837162", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "06/24/25", "$50.15", "2", "$100.30", ""],
-        ["BY892613", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "07/11/25", "$50.15", "1", "$50.15", ""],
-        ["BZ034330", "3306-638", "BENCO", "GRAHAM LIDOCAINE 1:100 RED 50", "08/19/25", "$50.15", "3", "$150.45", ""],
-        ["", "", "", "", "", "", "Total for Anesthetic - Lidocaines:", "", "$960.81"],
-        ["Anesthetic - Mepivicaines", "", "", "", "", "", "", "", ""],
-        ["Order", "Item", "Mfgr", "Description", "Order Date", "Price", "Qty", "Amount", ""],
-        ["BY220583", "3306-656", "BENCO", "GRAHAM MEPIVACAINE 3% BX50", "12/11/24", "$51.56", "1", "$51.56", ""],
-        ["", "", "", "", "", "", "Total for Anesthetic - Mepivicaines:", "", "$51.56"],
-        ["Anesthetic - Articaine", "", "", "", "", "", "", "", ""],
-        ["Order", "Item", "Mfgr", "Description", "Order Date", "Price", "Qty", "Amount", ""],
-        ["BX840418", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "08/19/24", "$47.69", "5", "$238.45", ""],
-        ["BX900215", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "09/06/24", "$47.69", "6", "$286.14", ""],
-        ["BX935041", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "09/17/24", "$47.69", "3", "$143.07", ""],
-        ["BX994503", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "10/04/24", "$47.69", "3", "$143.07", ""],
-        ["BY037670", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "10/16/24", "$47.69", "5", "$238.45", ""],
-        ["BY080297", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "10/29/24", "$47.69", "3", "$143.07", ""],
-        ["BY124675", "4707-113", "PIERREL", "ORABLOC 4% W/EPI 1:100 GLD 50", "11/12/24", "$47.69", "3", "$143.07", ""],
-        ["", "", "", "", "", "", "Total for Anesthetic - Articaine:", "", "$906.11"],
-        ["Gloves", "", "", "", "", "", "", "", ""],
-        ["Order", "Item", "Mfgr", "Description", "Order Date", "Price", "Qty", "Amount", ""],
-        ["BZ100001", "GLV-MED-NIT", "MEDLINE", "Nitrile Gloves - Medium", "08/12/25", "$11.90", "20", "$238.00", ""],
-        ["Preventive", "", "", "", "", "", "", "", ""],
-        ["Order", "Item", "Mfgr", "Description", "Order Date", "Price", "Qty", "Amount", ""],
-        ["BZ100114", "UNKNOWN-PASTE", "3M", "PROPHY PASTE MEDIUM MINT 200CT", "08/14/25", "$28.50", "4", "$114.00", ""],
-    ]
-    return pd.DataFrame(rows)
-
-
-def read_upload(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file, header=None, dtype=str)
-    return pd.read_excel(uploaded_file, header=None, dtype=str)
-
-
-def build_excel(
-    metadata: dict[str, str],
-    raw_cleaned: pd.DataFrame,
-    aggregated: pd.DataFrame,
-    final: pd.DataFrame,
-    catalog: pd.DataFrame,
-) -> bytes:
-    output = io.BytesIO()
-    summary = pd.DataFrame(
-        [
-            ["Prospect", metadata.get("Prepared For", "")],
-            ["Supplier", metadata.get("Supplier", "")],
-            ["Account Number", metadata.get("Account Number", "")],
-            ["Current Spend", final["Current_Spend"].sum() if not final.empty else 0],
-            ["SourceClub Spend", final["SourceClub_Spend"].sum() if not final.empty else 0],
-            ["Projected Savings", final["Projected_Savings"].sum() if not final.empty else 0],
-            ["Items Needing Review", int(final["Match_Status"].isin(["Needs Review", "No Match"]).sum()) if not final.empty else 0],
-        ],
-        columns=["Metric", "Value"],
-    )
-    architecture = pd.DataFrame(
-        {
-            "Step": [
-                "Vendor cleanup",
-                "Normalization",
-                "Aggregation",
-                "Matching",
-                "Human review",
-                "Export",
-            ],
-            "What happens": [
-                "Find repeated Benco table headers and remove report headers/subtotals.",
-                "Standardize columns into SourceClub's canonical purchase-history schema.",
-                "Combine duplicate item purchases and calculate weighted current unit price.",
-                "Use SKU, manufacturer, token overlap, and description similarity.",
-                "Route low-confidence matches to a reviewer for approval.",
-                "Generate the prospect-facing PDF and operator spreadsheet.",
-            ],
-        }
-    )
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        summary.to_excel(writer, sheet_name="Executive Summary", index=False)
-        final.to_excel(writer, sheet_name="Savings Analysis", index=False)
-        final[final["Match_Status"].isin(["Needs Review", "No Match"])].to_excel(
-            writer, sheet_name="Review Queue", index=False
-        )
-        aggregated.to_excel(writer, sheet_name="Aggregated History", index=False)
-        raw_cleaned.to_excel(writer, sheet_name="Cleaned Raw Lines", index=False)
-        catalog.to_excel(writer, sheet_name="SourceClub Catalog", index=False)
-        architecture.to_excel(writer, sheet_name="Architecture Notes", index=False)
-    return output.getvalue()
-
-
-def build_pdf(metadata: dict[str, str], final: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    if not REPORTLAB_AVAILABLE:
-        return b""
-
-    doc = SimpleDocTemplate(
-        output,
-        pagesize=landscape(letter),
-        rightMargin=0.35 * inch,
-        leftMargin=0.35 * inch,
-        topMargin=0.35 * inch,
-        bottomMargin=0.35 * inch,
-    )
-    styles = getSampleStyleSheet()
-    story = [
-        Paragraph(f"{metadata.get('Prepared For', 'Prospect')} Savings Analysis", styles["Title"]),
-        Paragraph(
-            f"Supplier analyzed: {metadata.get('Supplier', 'Unknown')} | Prepared {date.today().isoformat()}",
-            styles["Normal"],
-        ),
-        Spacer(1, 0.15 * inch),
-    ]
-
-    current = final["Current_Spend"].sum() if not final.empty else 0
-    source = final["SourceClub_Spend"].sum() if not final.empty else 0
-    savings = final["Projected_Savings"].sum() if not final.empty else 0
-    review_count = int(final["Match_Status"].isin(["Needs Review", "No Match"]).sum()) if not final.empty else 0
-    story.append(
-        Paragraph(
-            f"<b>Current spend:</b> {money(current)}    "
-            f"<b>SourceClub spend:</b> {money(source)}    "
-            f"<b>Projected savings:</b> {money(savings)}    "
-            f"<b>Review items:</b> {review_count}",
-            styles["Heading3"],
-        )
-    )
-
-    table_rows = [["Prospect Item", "SourceClub Match", "Current", "SourceClub", "Qty", "Savings", "Status"]]
-    for _, row in final.head(26).iterrows():
-        table_rows.append(
-            [
-                str(row["Description"])[:36],
-                str(row["Suggested_SourceClub_Match"] or "Needs review")[:38],
-                money(row["Current_Unit_Price"]),
-                money(row["SourceClub_Price"]) if pd.notna(row["SourceClub_Price"]) else "-",
-                f"{row['Quantity']:,.0f}",
-                money(row["Projected_Savings"]),
-                str(row["Match_Status"]),
-            ]
-        )
-    table = Table(table_rows, repeatRows=1)
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f6b73")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d0d5dd")),
-                ("FONT", (0, 0), (-1, -1), "Helvetica", 7),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
-            ]
-        )
-    )
-    story.append(table)
-    story.append(Spacer(1, 0.15 * inch))
-    story.append(
-        Paragraph(
-            "Notes: low-confidence and unmatched items are intentionally flagged for human review. "
-            "Approved matches should be stored so future analyses become faster and more accurate.",
-            styles["Normal"],
-        )
-    )
-    doc.build(story)
-    return output.getvalue()
-
-
-def hubspot_payload(metadata: dict[str, str], final: pd.DataFrame, review_count: int) -> dict[str, Any]:
-    return {
-        "properties": {
-            get_config("HUBSPOT_PROP_LAST_ANALYSIS", "sourceclub_last_analysis_date"): date.today().isoformat(),
-            get_config("HUBSPOT_PROP_SUPPLIER", "sourceclub_current_supplier"): metadata.get("Supplier", ""),
-            get_config("HUBSPOT_PROP_CURRENT_SPEND", "sourceclub_current_spend"): round(float(final["Current_Spend"].sum()), 2),
-            get_config("HUBSPOT_PROP_SOURCECLUB_SPEND", "sourceclub_projected_sourceclub_spend"): round(float(final["SourceClub_Spend"].sum()), 2),
-            get_config("HUBSPOT_PROP_SAVINGS", "sourceclub_projected_savings"): round(float(final["Projected_Savings"].sum()), 2),
-            get_config("HUBSPOT_PROP_REVIEW_COUNT", "sourceclub_review_item_count"): int(review_count),
-        }
-    }
-
-
-def push_hubspot_company_update(metadata: dict[str, str], final: pd.DataFrame, review_count: int) -> tuple[bool, str]:
-    token = get_config("HUBSPOT_PRIVATE_APP_TOKEN", "")
-    company_id = get_config("HUBSPOT_COMPANY_ID", "")
-    if not token or not company_id:
-        return False, "Add HUBSPOT_PRIVATE_APP_TOKEN and HUBSPOT_COMPANY_ID to enable the HubSpot push."
-    if not REQUESTS_AVAILABLE:
-        return False, "The requests package is unavailable."
-
-    url = f"https://api.hubapi.com/crm/v3/objects/companies/{company_id}"
-    response = requests.patch(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json=hubspot_payload(metadata, final, review_count),
-        timeout=20,
-    )
-    if response.ok:
-        return True, "HubSpot company record updated."
-    return False, f"HubSpot update failed: {response.status_code} {response.text[:300]}"
-
-
-def run_pipeline(raw: pd.DataFrame, catalog: pd.DataFrame):
-    cleaned, metadata = clean_purchase_history(raw)
-    aggregated = aggregate_history(cleaned)
-    matched = match_items(aggregated, catalog)
-    return cleaned, metadata, aggregated, matched
-
-
-st.title("SourceClub Savings Analysis Automation")
-st.caption("Built around the real Benco workflow: messy purchase-history export in, matched PDF and spreadsheet out.")
-
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Production Controls")
-    st.caption("These features are live when their environment variables are configured.")
-    st.write("Login:", "Enabled" if get_config("APP_USERNAME", "") else "Demo mode")
-    st.write("Match memory:", f"SQLite ({DB_PATH})")
-    st.write("AI matching:", "Enabled" if get_config("OPENAI_API_KEY", "") else "Off")
-    st.write("HubSpot push:", "Enabled" if get_config("HUBSPOT_PRIVATE_APP_TOKEN", "") else "Off")
+    st.markdown("## 🦷 Source Club")
+    st.markdown("**Savings Analysis Tool**")
+    st.divider()
 
-catalog = st.data_editor(
-    CATALOG,
-    hide_index=True,
-    use_container_width=True,
-    num_rows="dynamic",
-    column_config={
-        "SourceClub_Price": st.column_config.NumberColumn("SourceClub Price", format="$%.2f"),
-        "Pack_Size": st.column_config.NumberColumn("Pack Size"),
-    },
-)
+    st.markdown("### ⚙️ Settings")
 
-tab_upload, tab_demo, tab_manual, tab_architecture = st.tabs(
-    ["Vendor Upload + Cleanup", "Benco Demo", "Manual Entry", "Architecture"]
-)
+    if ENV_KEY:
+        st.success("✅ API key loaded from environment")
+    else:
+        manual_key = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            value=st.session_state.api_key,
+            placeholder="sk-ant-...",
+            help="Or set ANTHROPIC_API_KEY env var on Render.",
+        )
+        if manual_key:
+            st.session_state.api_key = manual_key
 
-raw_df: pd.DataFrame | None = None
-data_source = ""
-
-with tab_upload:
-    st.subheader("Upload raw vendor purchase history")
-    st.markdown(
-        "<div class='small-note'>This accepts the messy Benco-style export shown in the Loom: branded header rows, repeated table headers, category rows, subtotals, and line items in one sheet.</div>",
-        unsafe_allow_html=True,
-    )
-    uploaded = st.file_uploader("Upload Benco CSV/XLSX", type=["csv", "xlsx", "xls"])
-    if uploaded:
-        raw_df = read_upload(uploaded)
-        data_source = uploaded.name
-        st.write("Raw upload preview")
-        st.dataframe(raw_df.head(25), use_container_width=True)
-
-with tab_demo:
-    st.subheader("Realistic Benco demo")
-    st.markdown(
-        "<div class='small-note'>Use this in the Loom walkthrough to show the before/after cleanup and matching flow without needing a private customer file.</div>",
-        unsafe_allow_html=True,
-    )
-    if st.button("Load realistic Benco export", type="primary"):
-        st.session_state["demo_loaded"] = True
-    if st.session_state.get("demo_loaded"):
-        raw_df = benco_demo_raw()
-        data_source = "Built-in Benco demo"
-        st.dataframe(raw_df, use_container_width=True, height=360)
-
-with tab_manual:
-    st.subheader("Manual entry fallback")
-    st.markdown(
-        "<div class='small-note'>This is the fallback when a prospect sends only a few line items or an export format the parser does not know yet.</div>",
-        unsafe_allow_html=True,
-    )
-    manual = st.data_editor(
-        pd.DataFrame(
-            [
-                {
-                    "Order": "MANUAL-1",
-                    "Vendor_Item_Number": "3306-638",
-                    "Manufacturer": "Benco",
-                    "Description": "GRAHAM LIDOCAINE 1:100 RED 50",
-                    "Order_Date": "",
-                    "Current_Unit_Price": 39.89,
-                    "Quantity": 12,
-                    "Current_Total": 478.68,
-                }
-            ]
-        ),
-        hide_index=True,
-        use_container_width=True,
-        num_rows="dynamic",
-    )
-    if st.button("Use manual rows"):
-        raw_df = manual
-        data_source = "Manual entry"
-
-with tab_architecture:
-    st.subheader("Production architecture")
-    st.markdown(
-        """
-        1. **Intake:** upload, email attachment, or vendor portal export.
-        2. **Vendor parser:** detect Benco/Patterson/Henry Schein layouts, remove branded report chrome, normalize columns.
-        3. **Aggregation:** combine duplicate purchases so savings are calculated on true volume.
-        4. **Matching engine:** exact SKU, approved match memory, fuzzy text, pack-size/unit logic, and AI for ambiguous descriptions.
-        5. **Human review:** low-confidence matches go to a review queue; approved decisions become match memory.
-        6. **Output:** prospect PDF, operator spreadsheet, HubSpot attachment, and sales notification.
-        """
-    )
-    st.info(
-        "The key design choice is not full automation at all costs. The system should automate the obvious 70-85%, make the uncertain 15-30% easy to review, and learn from every approved match."
+    confidence_threshold = st.slider(
+        "Auto-accept threshold",
+        min_value=50, max_value=95, value=80, step=5,
+        help="Matches at or above this score are auto-accepted. Below → Review Queue.",
     )
 
-if raw_df is None:
-    st.info("Load the Benco demo, upload a vendor file, or use manual rows to run the savings analysis.")
-    st.stop()
+    st.divider()
+    st.markdown("### 🏗️ Pipeline")
+    st.markdown("""
+<div class="arch-box">
+1️⃣ <b>Upload</b> prospect CSV + catalog<br>
+2️⃣ <b>Parse</b> &amp; normalize<br>
+3️⃣ <b>AI Match</b> via Claude<br>
+4️⃣ <b>Score</b> confidence 0–100<br>
+5️⃣ <b>Route</b> high → auto / low → review<br>
+6️⃣ <b>Report</b> internal + prospect one-pager
+</div>
+""", unsafe_allow_html=True)
 
-cleaned, metadata, aggregated, matched = run_pipeline(raw_df, catalog)
+    st.divider()
+    st.caption("Source Club · Savings Analysis v2.1")
 
-if cleaned.empty:
-    st.error(
-        "No purchase-history rows were found. The parser looks for Benco-style repeated headers with Order, Item, Mfgr, Description, Order Date, Price, Qty, and Amount."
+# ─────────────────────────────────────────────────────────────────────────────
+# HERO
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="hero">
+  <h1>🦷 Savings Analysis Automation</h1>
+  <p>Upload a prospect's purchase history · AI matches every line item · Generate a savings report in seconds.</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def confidence_badge(score):
+    if score is None:
+        return '<span class="badge badge-none">N/A</span>'
+    if score >= 80:
+        return f'<span class="badge badge-high">✓ {score}%</span>'
+    if score >= 55:
+        return f'<span class="badge badge-med">~ {score}%</span>'
+    return f'<span class="badge badge-low">? {score}%</span>'
+
+
+def calc_rows(matches, reviewed, edited_price, threshold):
+    out = []
+    for m in matches:
+        idx   = m["idx"]
+        dec   = reviewed.get(idx)
+        ep    = edited_price.get(idx, m["sc_price"])
+        conf  = m["confidence"]
+        auto  = conf is not None and conf >= threshold and m["sc_sku"] is not None
+
+        if   dec == "reject":               include = False
+        elif dec in ("accept", "edit"):     include = True
+        elif auto:                          include = True
+        else:                               include = False
+
+        use_price = ep if include else None
+        mo_their  = m["their_price"] * m["qty_per_month"]
+        mo_sc     = (use_price or 0) * m["qty_per_month"] if include and use_price else None
+        mo_save   = (mo_their - mo_sc) if mo_sc is not None else None
+
+        status = (
+            "Auto-accepted" if (auto and dec != "reject") else
+            "Accepted"      if dec == "accept" else
+            "Edited"        if dec == "edit"   else
+            "Rejected"      if dec == "reject" else
+            "Pending Review"
+        )
+
+        out.append({**m,
+            "eff_sc_price": ep,
+            "include": include,
+            "monthly_their": mo_their,
+            "monthly_sc": mo_sc,
+            "monthly_save": mo_save,
+            "annual_save": mo_save * 12 if mo_save is not None else None,
+            "status": status,
+        })
+    return out
+
+
+def make_excel(rows, prospect_name, total_their, total_sc, total_save, pct_save, matched):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        # Sheet 1 – Summary
+        pd.DataFrame({
+            "Metric": ["Prospect","Analysis Date","Current Annual Spend",
+                        "Source Club Annual Cost","Annual Savings",
+                        "Monthly Savings","Savings %","Items Analyzed","Items Matched"],
+            "Value":  [prospect_name, datetime.today().strftime("%B %d, %Y"),
+                       f"${total_their:,.2f}", f"${total_sc:,.2f}",
+                       f"${total_save:,.2f}", f"${total_save/12:,.2f}",
+                       f"{pct_save:.1f}%", len(rows), matched],
+        }).to_excel(w, sheet_name="Summary", index=False)
+
+        # Sheet 2 – Line Items
+        detail = []
+        for r in rows:
+            detail.append({
+                "Prospect Item":    r["description"],
+                "Prospect SKU":     r["sku"],
+                "Supplier":         r["supplier"],
+                "Their Price":      r["their_price"],
+                "Qty/Month":        r["qty_per_month"],
+                "SC Match":         r["matched_name"] or "No match",
+                "SC SKU":           r["sc_sku"] or "—",
+                "SC Price":         r["eff_sc_price"] or "",
+                "Unit Savings":     (r["their_price"] - (r["eff_sc_price"] or r["their_price"])) if r["include"] else "",
+                "Monthly Savings":  r["monthly_save"] or "",
+                "Annual Savings":   r["annual_save"] or "",
+                "Confidence %":     r["confidence"],
+                "AI Reasoning":     r["reasoning"],
+                "Status":           r["status"],
+            })
+        pd.DataFrame(detail).to_excel(w, sheet_name="Line Items", index=False)
+
+        # Sheet 3 – Unmatched
+        unmatched = [r for r in rows if not r["sc_sku"] or r["sc_sku"] == "MANUAL"]
+        if unmatched:
+            pd.DataFrame([{
+                "Item": r["description"], "SKU": r["sku"],
+                "Their Price": r["their_price"], "Note": r["reasoning"]
+            } for r in unmatched]).to_excel(w, sheet_name="Unmatched Items", index=False)
+
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI MATCHING
+# ─────────────────────────────────────────────────────────────────────────────
+def run_matching(prospect_df, catalog_df, api_key, progress, status_text):
+    client       = anthropic.Anthropic(api_key=api_key)
+    catalog_json = catalog_df.to_json(orient="records", indent=2)
+    results      = []
+    total        = len(prospect_df)
+
+    for i, row in prospect_df.iterrows():
+        status_text.text(f"Matching {i+1}/{total}: {str(row.get('Item Description',''))[:55]}…")
+        progress.progress(i / total)
+
+        item = {
+            "description":   str(row.get("Item Description", "")),
+            "sku":           str(row.get("SKU", "")),
+            "unit_price":    float(row.get("Unit Price", 0)),
+            "qty_per_month": float(row.get("Qty/Month", 0)),
+            "supplier":      str(row.get("Supplier", "")),
+        }
+
+        prompt = f"""You are a dental supply product-matching expert for Source Club.
+
+Match the PROSPECT ITEM to the best product in the SOURCE CLUB CATALOG.
+
+PROSPECT ITEM:
+{json.dumps(item, indent=2)}
+
+SOURCE CLUB CATALOG:
+{catalog_json}
+
+RULES
+• Match on product TYPE and FUNCTION first
+• Pack sizes must be equivalent (100/box = 100ct = Box/100)
+• Different brands are acceptable if functionally identical
+• Size/grade MUST match (Medium ≠ Large)
+• If no reasonable match exists, set sc_sku to null
+
+Respond ONLY with raw JSON — no markdown, no explanation:
+{{
+  "sc_sku": "<SC_SKU or null>",
+  "matched_product_name": "<name or null>",
+  "confidence": <0-100>,
+  "reasoning": "<one sentence>",
+  "pack_size_note": "<adjustment needed or 'same'>"
+}}"""
+
+        try:
+            resp = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw  = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+            data = json.loads(raw)
+        except Exception as e:
+            data = {"sc_sku": None, "matched_product_name": None,
+                    "confidence": 0, "reasoning": f"Error: {e}", "pack_size_note": "N/A"}
+
+        sc_price = None
+        if data.get("sc_sku"):
+            mask = catalog_df["SC_SKU"] == data["sc_sku"]
+            if mask.any():
+                sc_price = float(catalog_df.loc[mask, "Source Club Price"].iloc[0])
+
+        results.append({
+            "idx":           i,
+            "description":   item["description"],
+            "sku":           item["sku"],
+            "supplier":      item["supplier"],
+            "their_price":   item["unit_price"],
+            "qty_per_month": item["qty_per_month"],
+            "sc_sku":        data.get("sc_sku"),
+            "matched_name":  data.get("matched_product_name"),
+            "sc_price":      sc_price,
+            "confidence":    data.get("confidence"),
+            "reasoning":     data.get("reasoning", ""),
+            "pack_size_note":data.get("pack_size_note", "same"),
+        })
+
+    progress.progress(1.0)
+    status_text.text("✅ Matching complete!")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABS
+# ─────────────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📤  Upload & Match",
+    "🔍  Review Queue",
+    "📊  Internal Report",
+    "📄  Prospect One-Pager",
+    "🏗️  Architecture",
+])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — UPLOAD & MATCH
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    if st.session_state.demo_mode:
+        st.markdown("""
+<div class="demo-banner">
+  🎯 <b>Demo mode:</b> Sample data pre-loaded. All tabs are live — explore the full workflow now.
+  Uncheck the box below to upload your own files and run live AI matching.
+</div>""", unsafe_allow_html=True)
+
+    use_sample = st.checkbox(
+        "Use sample demo data (no upload needed)",
+        value=st.session_state.demo_mode,
     )
-    st.stop()
 
-st.divider()
-initial_current_total = matched["Current_Spend"].sum() if not matched.empty else 0
-initial_savings_total = matched["Projected_Savings"].sum() if not matched.empty else 0
-confidence_counts = matched["Confidence_Band"].value_counts().to_dict() if "Confidence_Band" in matched else {}
+    if use_sample:
+        st.session_state.prospect_df  = SAMPLE_PROSPECT.copy()
+        st.session_state.catalog_df   = SAMPLE_CATALOG.copy()
+        st.session_state.demo_mode    = True
+        if not st.session_state.analysis_done:
+            st.session_state.matches      = DEMO_MATCHES.copy()
+            st.session_state.analysis_done= True
 
-st.subheader("Executive snapshot")
-snapshot_cols = st.columns(5)
-snapshot_cols[0].metric("Total items processed", f"{len(aggregated):,}")
-snapshot_cols[1].metric("Potential savings", money(initial_savings_total))
-snapshot_cols[2].metric("High confidence", f"{confidence_counts.get('High', 0):,}")
-snapshot_cols[3].metric("Medium confidence", f"{confidence_counts.get('Medium', 0):,}")
-snapshot_cols[4].metric("Low confidence", f"{confidence_counts.get('Low', 0):,}")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Prospect Purchase History (10 items)**")
+            st.dataframe(SAMPLE_PROSPECT, use_container_width=True, height=260)
+        with col2:
+            st.markdown("**Source Club Catalog (12 products)**")
+            st.dataframe(SAMPLE_CATALOG, use_container_width=True, height=260)
+    else:
+        st.session_state.demo_mode = False
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Prospect Purchase History**")
+            st.caption("Required columns: `Item Description`, `Unit Price`, `Qty/Month`")
+            pf = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx"], key="pf")
+            if pf:
+                st.session_state.prospect_df = pd.read_csv(pf) if pf.name.endswith(".csv") else pd.read_excel(pf)
+                st.dataframe(st.session_state.prospect_df, use_container_width=True, height=220)
+        with col2:
+            st.markdown("**Source Club Catalog**")
+            st.caption("Required columns: `Product Name`, `SC_SKU`, `Source Club Price`")
+            cf = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx"], key="cf")
+            if cf:
+                st.session_state.catalog_df = pd.read_csv(cf) if cf.name.endswith(".csv") else pd.read_excel(cf)
+                st.dataframe(st.session_state.catalog_df, use_container_width=True, height=220)
 
-flow_cols = st.columns(4)
-flow_cols[0].markdown("<div class='flow-card'><strong>1. Clean vendor export</strong><span class='small-note'>Remove Benco headers, subtotals, blanks, and repeated table chrome.</span></div>", unsafe_allow_html=True)
-flow_cols[1].markdown("<div class='flow-card'><strong>2. Normalize purchases</strong><span class='small-note'>Convert raw rows into one canonical purchase-history table.</span></div>", unsafe_allow_html=True)
-flow_cols[2].markdown("<div class='flow-card'><strong>3. Match and review</strong><span class='small-note'>Auto-match confident rows and route uncertain rows to review.</span></div>", unsafe_allow_html=True)
-flow_cols[3].markdown("<div class='flow-card'><strong>4. Export package</strong><span class='small-note'>Generate the prospect PDF, detailed spreadsheet, and cleaned CSV.</span></div>", unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Run AI Matching</div>', unsafe_allow_html=True)
 
-st.subheader("1. Vendor cleanup result")
-meta_cols = st.columns(4)
-meta_cols[0].metric("Prospect", metadata.get("Prepared For", "Unknown"))
-meta_cols[1].metric("Supplier", metadata.get("Supplier", "Unknown"))
-meta_cols[2].metric("Raw lines found", f"{len(cleaned):,}")
-meta_cols[3].metric("Unique items", f"{len(aggregated):,}")
-
-with st.expander("Show cleaned purchase-history lines"):
-    st.dataframe(cleaned, use_container_width=True)
-
-st.subheader("2. Aggregated purchase history")
-st.dataframe(
-    aggregated[
-        [
-            "Vendor_Item_Number",
-            "Manufacturer",
-            "Description",
-            "Quantity",
-            "Current_Unit_Price",
-            "Current_Total",
-            "Orders",
-        ]
-    ],
-    use_container_width=True,
-    column_config={
-        "Current_Unit_Price": st.column_config.NumberColumn("Weighted Current Price", format="$%.2f"),
-        "Current_Total": st.column_config.NumberColumn("Current Spend", format="$%.2f"),
-    },
-)
-
-st.subheader("3. Match review queue")
-review_options = [""] + catalog["SourceClub_Item_Name"].tolist()
-review_input = matched.copy()
-review_input["Reviewer_Selected_Match"] = ""
-review_input["Reviewer_SourceClub_Price"] = review_input["SourceClub_Price"]
-
-low_confidence = review_input[review_input["Confidence_Band"].isin(["Medium", "Low"])]
-if not low_confidence.empty:
-    st.warning(
-        f"{len(low_confidence)} row(s) need an operator look before sending. Use the override columns on the right to approve a different item or price."
-    )
-    st.dataframe(
-        low_confidence[
-            [
-                "Vendor_Item_Number",
-                "Description",
-                "Suggested_SourceClub_Match",
-                "Confidence_Band",
-                "Match_Confidence",
-                "Match_Reason",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-else:
-    st.success("All matched rows cleared the high-confidence threshold. Review is still available for price overrides.")
-
-reviewed = st.data_editor(
-    review_input,
-    hide_index=True,
-    use_container_width=True,
-    column_order=[
-        "Vendor_Item_Number",
-        "Manufacturer",
-        "Description",
-        "Quantity",
-        "Current_Unit_Price",
-        "Suggested_SourceClub_Match",
-        "SourceClub_Price",
-        "Match_Status",
-        "Confidence_Band",
-        "Match_Confidence",
-        "Match_Reason",
-        "Reviewer_Selected_Match",
-        "Reviewer_SourceClub_Price",
-    ],
-    column_config={
-        "Current_Unit_Price": st.column_config.NumberColumn("Current Price", format="$%.2f"),
-        "SourceClub_Price": st.column_config.NumberColumn("SourceClub Price", format="$%.2f"),
-        "Match_Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1),
-        "Confidence_Band": st.column_config.TextColumn("Band"),
-        "Reviewer_Selected_Match": st.column_config.SelectboxColumn(
-            "Reviewer Override",
-            options=review_options,
-            help="Use this when the suggested match is wrong or the item was below the auto-match threshold.",
-        ),
-        "Reviewer_SourceClub_Price": st.column_config.NumberColumn(
-            "Override Price",
-            format="$%.2f",
-            help="Optional. Enter a corrected SourceClub price without changing the catalog.",
-        ),
-    },
-    disabled=[
-        "Vendor_Item_Number",
-        "Manufacturer",
-        "Description",
-        "Quantity",
-        "Current_Unit_Price",
-        "Suggested_SourceClub_Match",
-        "SourceClub_Price",
-        "Match_Status",
-        "Match_Confidence",
-        "Confidence_Band",
-        "Match_Reason",
-    ],
-)
-
-final = apply_manual_review(reviewed, catalog)
-
-current_total = final["Current_Spend"].sum()
-source_total = final["SourceClub_Spend"].sum()
-savings_total = final["Projected_Savings"].sum()
-review_count = int(final["Match_Status"].isin(["Needs Review", "No Match"]).sum())
-savings_rate = savings_total / current_total if current_total else 0
-final_confidence_counts = final["Confidence_Band"].value_counts().to_dict() if "Confidence_Band" in final else {}
-
-st.subheader("4. Prospect-ready savings package")
-metric_cols = st.columns(6)
-metric_cols[0].metric("Items Processed", f"{len(final):,}")
-metric_cols[1].metric("Current Spend", money(current_total))
-metric_cols[2].metric("SourceClub Spend", money(source_total))
-metric_cols[3].metric("Projected Savings", money(savings_total))
-metric_cols[4].metric("Savings Rate", f"{savings_rate:.1%}")
-metric_cols[5].metric("Needs Review", f"{review_count:,}")
-
-band_cols = st.columns(3)
-band_cols[0].metric("High Confidence", f"{final_confidence_counts.get('High', 0):,}")
-band_cols[1].metric("Medium Confidence", f"{final_confidence_counts.get('Medium', 0):,}")
-band_cols[2].metric("Low Confidence", f"{final_confidence_counts.get('Low', 0):,}")
-
-if review_count:
-    st.markdown(
-        f"<div class='review-box'><b>{review_count} item(s) need review.</b> This is intentional: the system automates confident matches and exposes uncertain matches before the prospect sees the final report.</div>",
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        "<div class='success-box'><b>All items are matched or reviewed.</b> The prospect PDF and detailed operator spreadsheet are ready to export.</div>",
-        unsafe_allow_html=True,
+    active_key = ENV_KEY or st.session_state.api_key
+    ready = (
+        st.session_state.prospect_df is not None and
+        st.session_state.catalog_df  is not None and
+        bool(active_key)
     )
 
-st.dataframe(
-    final[
-        [
-            "Description",
-            "Suggested_SourceClub_Match",
-            "Current_Unit_Price",
-            "SourceClub_Price",
-            "Quantity",
-            "Current_Spend",
-            "SourceClub_Spend",
-            "Projected_Savings",
-            "Match_Status",
-            "Confidence_Band",
-            "Match_Reason",
-        ]
-    ],
-    use_container_width=True,
-    column_config={
-        "Current_Unit_Price": st.column_config.NumberColumn("Current Price", format="$%.2f"),
-        "SourceClub_Price": st.column_config.NumberColumn("SourceClub Price", format="$%.2f"),
-        "Current_Spend": st.column_config.NumberColumn("Current Spend", format="$%.2f"),
-        "SourceClub_Spend": st.column_config.NumberColumn("SourceClub Spend", format="$%.2f"),
-        "Projected_Savings": st.column_config.NumberColumn("Projected Savings", format="$%.2f"),
-    },
-)
+    if not active_key:
+        st.warning("⚠️ No Anthropic API key found. Set ANTHROPIC_API_KEY on Render or enter one in the sidebar.")
 
-xlsx = build_excel(metadata, cleaned, aggregated, final, catalog)
-pdf = build_pdf(metadata, final)
+    if st.button("🤖  Run Live AI Matching", disabled=not ready, type="primary", use_container_width=True):
+        st.session_state.matches       = []
+        st.session_state.reviewed      = {}
+        st.session_state.edited_price  = {}
+        st.session_state.analysis_done = False
 
-download_cols = st.columns(3)
-download_cols[0].download_button(
-    "Download detailed spreadsheet",
-    data=xlsx,
-    file_name="sourceclub_savings_analysis.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    type="primary",
-)
-if REPORTLAB_AVAILABLE and pdf:
-    download_cols[1].download_button(
-        "Download prospect PDF",
-        data=pdf,
-        file_name="sourceclub_savings_analysis.pdf",
-        mime="application/pdf",
-        type="primary",
-    )
-else:
-    download_cols[1].warning("PDF export needs reportlab in requirements.txt.")
-download_cols[2].download_button(
-    "Download cleaned CSV",
-    data=cleaned.to_csv(index=False).encode("utf-8"),
-    file_name="cleaned_purchase_history.csv",
-    mime="text/csv",
-)
+        prog   = st.progress(0)
+        status = st.empty()
+        t0     = time.time()
+        try:
+            st.session_state.matches       = run_matching(
+                st.session_state.prospect_df,
+                st.session_state.catalog_df,
+                active_key, prog, status,
+            )
+            st.session_state.analysis_done = True
+            st.session_state.demo_mode     = False
+            st.success(f"✅ {len(st.session_state.matches)} items matched in {time.time()-t0:.1f}s")
+        except Exception as e:
+            st.error(f"❌ {e}")
 
-st.subheader("5. Production actions")
-prod_cols = st.columns(3)
-if prod_cols[0].button("Save approved matches to memory", type="primary"):
-    saved = save_approved_matches(final, st.session_state.get("username", "demo-user"))
-    save_analysis_run(metadata, final, review_count)
-    st.success(f"Saved {saved} approved match(es) to persistent match memory.")
+    # Quick stats if done
+    if st.session_state.analysis_done:
+        m   = st.session_state.matches
+        thr = confidence_threshold
+        high = sum(1 for x in m if x["confidence"] and x["confidence"] >= thr)
+        rev  = sum(1 for x in m if x["confidence"] and x["confidence"] < thr and x["sc_sku"])
+        none_= sum(1 for x in m if not x["sc_sku"])
+        st.markdown(f"""
+<div class="metric-row">
+  <div class="metric-card"><div class="val">{len(m)}</div><div class="lbl">Total Items</div></div>
+  <div class="metric-card"><div class="val" style="color:#057a55">{high}</div><div class="lbl">Auto-Accepted</div></div>
+  <div class="metric-card"><div class="val" style="color:#c27803">{rev}</div><div class="lbl">Needs Review</div></div>
+  <div class="metric-card"><div class="val" style="color:#c81e1e">{none_}</div><div class="lbl">No Match</div></div>
+</div>""", unsafe_allow_html=True)
+        st.info("👉 Explore the **Review Queue**, **Internal Report**, and **Prospect One-Pager** tabs.")
 
-with prod_cols[1]:
-    if st.button("Preview HubSpot payload"):
-        st.json(hubspot_payload(metadata, final, review_count))
 
-with prod_cols[2]:
-    if st.button("Push summary to HubSpot"):
-        ok, message = push_hubspot_company_update(metadata, final, review_count)
-        if ok:
-            st.success(message)
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — REVIEW QUEUE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    if not st.session_state.analysis_done:
+        st.info("Run AI Matching first (Tab 1).")
+    else:
+        matches   = st.session_state.matches
+        thr       = confidence_threshold
+        flag_items = [m for m in matches if m["confidence"] is not None
+                       and m["confidence"] < thr and m["sc_sku"]]
+        no_items   = [m for m in matches if not m["sc_sku"]]
+
+        st.markdown(
+            f'<div class="section-title">🔍 Review Queue — {len(flag_items)} flagged matches</div>',
+            unsafe_allow_html=True,
+        )
+        if st.session_state.demo_mode:
+            st.markdown("""
+<div class="demo-banner">
+  Demo data: one item was intentionally given a lower confidence score to demonstrate the review workflow.
+</div>""", unsafe_allow_html=True)
+
+        if not flag_items:
+            st.success("🎉 All items matched above your confidence threshold — nothing to review!")
         else:
-            st.warning(message)
+            st.caption(f"These matches scored below {thr}%. Accept, reject, or manually override the price.")
+            for m in flag_items:
+                idx     = m["idx"]
+                current = st.session_state.reviewed.get(idx)
+                with st.container():
+                    st.markdown('<div class="review-card flagged">', unsafe_allow_html=True)
+                    c1, c2 = st.columns([3, 1])
+                    with c1:
+                        st.markdown(f"**Prospect item:** {m['description']}")
+                        st.markdown(f"**Suggested match:** {m['matched_name']}")
+                        st.markdown(f"*AI reasoning: {m['reasoning']}*")
+                        if m["pack_size_note"] and m["pack_size_note"].lower() != "same":
+                            st.warning(f"⚠️ Pack size note: {m['pack_size_note']}")
+                    with c2:
+                        st.markdown(confidence_badge(m["confidence"]), unsafe_allow_html=True)
+                        st.markdown(f"Their price: **${m['their_price']:.2f}**")
+                        ep = st.session_state.edited_price.get(idx, m["sc_price"])
+                        st.markdown(f"SC price: **${ep:.2f}**" if ep else "SC price: N/A")
 
-with st.expander("Production setup notes"):
-    st.markdown(
-        """
-        Configure these environment variables in Render when you want production behavior:
+                    a, b, c = st.columns(3)
+                    with a:
+                        if st.button("✅ Accept", key=f"acc_{idx}", use_container_width=True):
+                            st.session_state.reviewed[idx] = "accept"; st.rerun()
+                    with b:
+                        if st.button("❌ Reject", key=f"rej_{idx}", use_container_width=True):
+                            st.session_state.reviewed[idx] = "reject"; st.rerun()
+                    with c:
+                        np_ = st.number_input("Override SC price $", min_value=0.0,
+                                              value=float(m["sc_price"] or 0),
+                                              step=0.01, key=f"np_{idx}")
+                        if st.button("✏️ Use this price", key=f"edit_{idx}", use_container_width=True):
+                            st.session_state.edited_price[idx] = np_
+                            st.session_state.reviewed[idx]     = "edit"
+                            st.rerun()
 
-        - `APP_USERNAME` and `APP_PASSWORD` or `APP_PASSWORD_HASH` for login.
-        - `OPENAI_API_KEY` and optional `OPENAI_MODEL` for AI-assisted low-confidence matching.
-        - `HUBSPOT_PRIVATE_APP_TOKEN`, `HUBSPOT_COMPANY_ID`, and optional custom property-name variables for HubSpot updates.
-        - `SOURCECLUB_DB_PATH` if the database should live somewhere other than the default SQLite file.
+                    if current:
+                        icon = {"accept":"🟢","reject":"🔴","edit":"🟡"}.get(current,"")
+                        st.markdown(f"{icon} **Status: {current.title()}**")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                    st.write("")
 
-        In a full deployment, the SQLite database should move to Postgres so match memory survives service rebuilds and supports multiple users safely.
-        """
-    )
+        # No-match section
+        if no_items:
+            st.markdown(
+                f'<div class="section-title">❌ No Catalog Match ({len(no_items)} items)</div>',
+                unsafe_allow_html=True,
+            )
+            for m in no_items:
+                with st.expander(f"🔴 {m['description']} — ${m['their_price']:.2f}/unit"):
+                    st.markdown(f"Supplier SKU: `{m['sku']}`  |  Supplier: {m['supplier']}")
+                    st.markdown(f"*AI note: {m['reasoning']}*")
+                    mp = st.number_input("Enter Source Club price if known ($)",
+                                         min_value=0.0, value=0.0, step=0.01,
+                                         key=f"mp_{m['idx']}")
+                    if st.button("Add to analysis", key=f"addm_{m['idx']}"):
+                        st.session_state.edited_price[m["idx"]] = mp
+                        st.session_state.reviewed[m["idx"]]     = "edit"
+                        for x in st.session_state.matches:
+                            if x["idx"] == m["idx"]:
+                                x["sc_price"]     = mp
+                                x["sc_sku"]       = "MANUAL"
+                                x["matched_name"] = "Manually entered"
+                                x["confidence"]   = 100
+                        st.rerun()
 
-st.caption(f"Data source: {data_source}. Prototype assumes annual period if the vendor export covers the trailing 12 months.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — INTERNAL REPORT
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    if not st.session_state.analysis_done:
+        st.info("Run AI Matching first (Tab 1).")
+    else:
+        rows  = calc_rows(st.session_state.matches, st.session_state.reviewed,
+                          st.session_state.edited_price, confidence_threshold)
+        name  = st.session_state.get("prospect_name", "Demo Practice")
+
+        total_their  = sum(r["monthly_their"] for r in rows) * 12
+        total_sc     = sum(r["monthly_sc"] * 12 for r in rows if r["monthly_sc"] is not None)
+        total_save   = sum(r["annual_save"] for r in rows if r["annual_save"] is not None)
+        pct_save     = total_save / total_their * 100 if total_their else 0
+        matched      = sum(1 for r in rows if r["include"])
+
+        st.markdown(f"""
+<div class="savings-hero">
+  <div class="big">${total_save:,.0f}</div>
+  <div class="sub">Estimated Annual Savings for {name} ({pct_save:.1f}% reduction)</div>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown(f"""
+<div class="metric-row">
+  <div class="metric-card"><div class="val">${total_their:,.0f}</div><div class="lbl">Current Annual Spend</div></div>
+  <div class="metric-card"><div class="val">${total_sc:,.0f}</div><div class="lbl">Source Club Annual Cost</div></div>
+  <div class="metric-card"><div class="val">${total_save/12:,.0f}</div><div class="lbl">Monthly Savings</div></div>
+  <div class="metric-card"><div class="val">{matched}/{len(rows)}</div><div class="lbl">Items Matched</div></div>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown('<div class="section-title">Line-Item Breakdown</div>', unsafe_allow_html=True)
+        disp = []
+        for r in rows:
+            disp.append({
+                "Item":           (r["description"][:52]+"…") if len(r["description"])>52 else r["description"],
+                "Their $":        f"${r['their_price']:.2f}",
+                "SC Match":       (r["matched_name"] or "—")[:48],
+                "SC $":           f"${r['eff_sc_price']:.2f}" if r["eff_sc_price"] else "—",
+                "Unit Save":      f"${r['their_price']-(r['eff_sc_price'] or r['their_price']):.2f}" if r["include"] else "—",
+                "Qty/mo":         int(r["qty_per_month"]),
+                "Annual Save":    f"${r['annual_save']:,.0f}" if r["annual_save"] else "—",
+                "Confidence":     f"{r['confidence']}%" if r["confidence"] else "N/A",
+                "Status":         r["status"],
+            })
+        st.dataframe(pd.DataFrame(disp), use_container_width=True, height=380)
+
+        pending = [r for r in rows if r["status"] == "Pending Review"]
+        if pending:
+            st.warning(f"⚠️ {len(pending)} items still pending review — not yet included in totals.")
+
+        st.markdown('<div class="section-title">Export</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            xlsx = make_excel(rows, name, total_their, total_sc, total_save, pct_save, matched)
+            st.download_button("⬇️ Download Excel Report (3 sheets)",
+                               data=xlsx,
+                               file_name=f"SC_savings_{datetime.today().strftime('%Y%m%d')}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               type="primary", use_container_width=True)
+        with c2:
+            csv_rows = [{"Item":r["description"],"Their $":r["their_price"],
+                         "SC $":r["eff_sc_price"] or "","Annual Save":r["annual_save"] or "",
+                         "Confidence":r["confidence"],"Status":r["status"]} for r in rows]
+            st.download_button("⬇️ Download CSV",
+                               data=pd.DataFrame(csv_rows).to_csv(index=False),
+                               file_name=f"SC_savings_{datetime.today().strftime('%Y%m%d')}.csv",
+                               mime="text/csv", use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — PROSPECT ONE-PAGER
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    if not st.session_state.analysis_done:
+        st.info("Run AI Matching first (Tab 1).")
+    else:
+        rows       = calc_rows(st.session_state.matches, st.session_state.reviewed,
+                               st.session_state.edited_price, confidence_threshold)
+        total_their = sum(r["monthly_their"] for r in rows) * 12
+        total_sc    = sum(r["monthly_sc"] * 12 for r in rows if r["monthly_sc"] is not None)
+        total_save  = sum(r["annual_save"] for r in rows if r["annual_save"] is not None)
+        pct_save    = total_save / total_their * 100 if total_their else 0
+
+        # Editable prospect name
+        pname = st.text_input("Practice name (for report)", value=st.session_state.get("prospect_name","Valley Dental Group"))
+        st.session_state.prospect_name = pname
+
+        st.markdown('<div class="section-title">Preview — What the prospect sees</div>', unsafe_allow_html=True)
+
+        # Build line-item table HTML
+        rows_html = ""
+        for r in rows:
+            if r["include"] and r["annual_save"]:
+                save_pct = (r["their_price"] - r["eff_sc_price"]) / r["their_price"] * 100 if r["eff_sc_price"] else 0
+                rows_html += f"""
+<tr>
+  <td>{r['description'][:55]}</td>
+  <td>${r['their_price']:.2f}</td>
+  <td>{r['matched_name'] or '—'}</td>
+  <td>${r['eff_sc_price']:.2f}</td>
+  <td class="green">-{save_pct:.0f}%</td>
+  <td class="green">${r['annual_save']:,.0f}/yr</td>
+</tr>"""
+
+        st.markdown(f"""
+<div class="prospect-card">
+  <h2>🦷 Source Club — Your Savings Analysis</h2>
+  <div class="sub-h">Prepared for {pname} &nbsp;·&nbsp; {datetime.today().strftime("%B %d, %Y")}</div>
+
+  <p>Based on your current purchase history, switching to Source Club's negotiated pricing would save your practice:</p>
+
+  <div style="text-align:center;margin:1.25rem 0;">
+    <span class="save-pill">💰 ${total_save:,.0f} per year &nbsp;|&nbsp; ${total_save/12:,.0f} per month</span>
+  </div>
+
+  <table class="prospect-table">
+    <thead>
+      <tr>
+        <th>You currently buy</th>
+        <th>Your price</th>
+        <th>Source Club equivalent</th>
+        <th>SC price</th>
+        <th>Savings %</th>
+        <th>Annual savings</th>
+      </tr>
+    </thead>
+    <tbody>
+      {rows_html}
+    </tbody>
+  </table>
+
+  <div style="margin-top:1.5rem;background:#f9fafb;border-radius:8px;padding:1rem 1.2rem;">
+    <div style="display:flex;gap:2rem;flex-wrap:wrap;text-align:center;">
+      <div style="flex:1;">
+        <div style="font-size:1.3rem;font-weight:700;color:#c81e1e;">${total_their:,.0f}</div>
+        <div style="font-size:.8rem;color:#6b7280;">Current annual spend</div>
+      </div>
+      <div style="flex:1;">
+        <div style="font-size:1.3rem;font-weight:700;color:#057a55;">${total_sc:,.0f}</div>
+        <div style="font-size:.8rem;color:#6b7280;">With Source Club</div>
+      </div>
+      <div style="flex:1;">
+        <div style="font-size:1.3rem;font-weight:700;color:#1a56db;">{pct_save:.1f}%</div>
+        <div style="font-size:.8rem;color:#6b7280;">Price reduction</div>
+      </div>
+      <div style="flex:1;">
+        <div style="font-size:1.3rem;font-weight:700;color:#1a56db;">${total_save/12:,.0f}</div>
+        <div style="font-size:.8rem;color:#6b7280;">Savings / month</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:1.25rem;font-size:.9rem;color:#374151;border-top:1px solid #e5e7eb;padding-top:1rem;">
+    <b>How Source Club works:</b> We negotiate volume pricing directly with dental manufacturers and pass the savings to member practices.
+    No long-term contracts. Setup takes less than 10 minutes. Start saving from your very first order.
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+        st.divider()
+        # Download prospect Excel
+        xlsx = make_excel(rows, pname, total_their, total_sc, total_save, pct_save,
+                          sum(1 for r in rows if r["include"]))
+        st.download_button(
+            "⬇️ Download Prospect Excel Report",
+            data=xlsx,
+            file_name=f"SC_savings_{pname.replace(' ','_')}_{datetime.today().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary", use_container_width=True,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — ARCHITECTURE & NEXT STEPS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown('<div class="section-title">🏗️ End-to-End Architecture</div>', unsafe_allow_html=True)
+    st.markdown("""
+```
+Prospect CSV  ──►  Parse & Normalize
+                        │
+                        ▼
+              AI Matching Engine (Claude)
+              ┌─────────────────────────────┐
+              │  Per line item:             │
+              │  • Semantic comparison      │
+              │  • Brand equivalence        │
+              │  • Pack-size reasoning      │
+              │  • Confidence 0–100         │
+              │  • Reasoning sentence       │
+              └─────────────────────────────┘
+                        │
+              Confidence Router
+          ┌─────────────┴──────────────┐
+      ≥ threshold                 < threshold
+    Auto-accepted              Human Review Queue
+          │                  Accept / Reject / Edit
+          └─────────────┬──────────────┘
+                        ▼
+             Savings Calculation
+          ┌──────────────┴──────────────┐
+     Internal Report          Prospect One-Pager
+     (line-item detail)       (clean send-ready PDF)
+```
+""")
+
+    st.markdown('<div class="section-title">🤖 Where AI Does the Work</div>', unsafe_allow_html=True)
+    st.markdown("""
+- **Semantic matching** — Claude understands "Nitrile Exam Gloves Medium PF 100/box" = "Sempermed Powder-Free Nitrile M Box/100" despite totally different SKUs, suppliers, and formatting.
+- **Pack-size reasoning** — automatically detects unit-of-measure differences and flags them.
+- **Confidence scoring** — self-rated certainty drives automatic routing; no rules engine needed.
+- **Transparent reasoning** — every match includes a plain-English explanation, so human review is fast.
+""")
+
+    st.markdown('<div class="section-title">👤 Where Humans Stay in the Loop</div>', unsafe_allow_html=True)
+    st.markdown("""
+- **Review Queue** — matches below the configurable threshold are surfaced before they affect savings totals.
+- **Price override** — any SC price can be manually corrected; unmatched items can be priced by hand.
+- **Report sign-off** — the founder approves the prospect one-pager before sending.
+
+Designed for ~85–90% auto-accept. The founder's attention is reserved for the 10–15% that genuinely need judgment — cutting 10 min/analysis to **≈2 min**.
+""")
+
+    st.markdown('<div class="section-title">⏱️ Time Impact</div>', unsafe_allow_html=True)
+    st.markdown("""
+| Step | Manual today | This tool |
+|---|---|---|
+| Upload & parse | 2 min | 30 sec |
+| Product matching | 6 min | ~45 sec (AI) |
+| Human review | — | 1–2 min |
+| Report generation | 2 min | Instant |
+| **Total / analysis** | **~10 min** | **~2–3 min** |
+| **30 analyses / month** | **5+ hours** | **~1 hour** |
+
+**4+ hours/month saved from day one.**
+""")
+
+    st.markdown('<div class="section-title">🚀 What I Would Build Next</div>', unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("""
+**Week 1–2**
+- 🗄️ Live Source Club catalog DB (replace CSV upload)
+- 📧 One-click "Send to prospect" email from inside the tool
+- 🔄 Batch mode: run 10 analyses overnight in parallel
+- 📊 Learning loop: store review decisions → improve matching over time
+""")
+    with c2:
+        st.markdown("""
+**Month 1–2**
+- 🔗 HubSpot/Salesforce: attach savings report to deal record
+- 📦 Automatic pack-size normalization engine
+- 🏷️ Direct API pull from Henry Schein / Patterson catalogs
+- 📈 Win-rate tracking: savings amount → close probability model
+""")
